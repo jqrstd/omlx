@@ -17,11 +17,13 @@ from omlx.api.anthropic_models import (
     AnthropicTool,
     AnthropicUsage,
     ContentBlockDeltaEvent,
+    ContentBlockDocument,
     ContentBlockStartEvent,
     ContentBlockStopEvent,
     ContentBlockText,
     ContentBlockToolResult,
     ContentBlockToolUse,
+    ContentBlockUnknown,
     ErrorEvent,
     InputJsonDelta,
     MessageDeltaEvent,
@@ -119,6 +121,57 @@ class TestContentBlocks:
 
         assert isinstance(block.content, list)
 
+    def test_content_block_document_pdf(self):
+        """Test creating document content block for PDF."""
+        block = ContentBlockDocument(
+            source={
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": "JVBERi0xLjQ=",
+            },
+            title="test.pdf",
+        )
+
+        assert block.type == "document"
+        assert block.source["media_type"] == "application/pdf"
+        assert block.title == "test.pdf"
+
+    def test_content_block_document_text(self):
+        """Test creating document content block for plain text."""
+        import base64
+
+        text_data = base64.b64encode(b"Hello world").decode()
+        block = ContentBlockDocument(
+            source={
+                "type": "base64",
+                "media_type": "text/plain",
+                "data": text_data,
+            },
+        )
+
+        assert block.type == "document"
+        assert block.title is None
+
+    def test_content_block_document_in_message(self):
+        """Test that document blocks are accepted in AnthropicMessage."""
+        msg = AnthropicMessage(
+            role="user",
+            content=[
+                ContentBlockText(text="Read this document:"),
+                ContentBlockDocument(
+                    source={
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": "JVBERi0=",
+                    },
+                    title="manual.pdf",
+                ),
+            ],
+        )
+
+        assert len(msg.content) == 2
+        assert msg.content[1].type == "document"
+
 
 class TestSystemContent:
     """Tests for SystemContent model."""
@@ -203,14 +256,45 @@ class TestAnthropicMessage:
         assert len(msg.content) == 2
 
     def test_message_role_validation(self):
-        """Test that message role must be user or assistant."""
-        # Valid roles
+        """Test that message role accepts user / assistant / system."""
+        # Valid roles (claude-code 2.1.154+ inlines role="system" entries
+        # in messages[] alongside the canonical system field, so the schema
+        # accepts them and the adapter normalizes them downstream).
         AnthropicMessage(role="user", content="Hello")
         AnthropicMessage(role="assistant", content="Hi")
+        AnthropicMessage(role="system", content="System")
 
         # Invalid role
         with pytest.raises(ValidationError):
-            AnthropicMessage(role="system", content="System")
+            AnthropicMessage(role="invalid_role", content="x")
+
+
+class TestContentBlockUnknownType:
+    def test_unknown_type_is_accepted(self):
+        msg = AnthropicMessage(
+            role="user",
+            content=[
+                {
+                    "type": "tool_addition",
+                    "tool": {"type": "tool_reference", "name": "mcp__x__y"},
+                }
+            ],
+        )
+
+        assert isinstance(msg.content[0], ContentBlockUnknown)
+
+    @pytest.mark.parametrize(
+        "block",
+        [{"type": "text"}, {"type": "tool_result", "content": "x"}, {"type": ""}],
+    )
+    def test_malformed_known_type_is_rejected(self, block):
+        with pytest.raises(ValidationError):
+            AnthropicMessage(role="user", content=[block])
+
+    def test_untyped_block_keeps_inferred_type(self):
+        msg = AnthropicMessage(role="user", content=[{"text": "hi"}])
+
+        assert type(msg.content[0]) is ContentBlockText
 
 
 class TestAnthropicTool:
@@ -252,6 +336,75 @@ class TestAnthropicTool:
         )
 
         assert tool.cache_control == {"type": "ephemeral"}
+
+    def test_server_side_web_search_tool(self):
+        """Server-side web_search tool: type-only, no input_schema."""
+        tool = AnthropicTool(type="web_search_20250305", name="web_search")
+
+        assert tool.type == "web_search_20250305"
+        assert tool.name == "web_search"
+        assert tool.input_schema is None
+
+    def test_server_side_code_execution_tool(self):
+        """Server-side code_execution tool validates without input_schema."""
+        tool = AnthropicTool(type="code_execution_20250825", name="code_execution")
+
+        assert tool.type == "code_execution_20250825"
+        assert tool.input_schema is None
+
+    def test_server_side_tool_with_extra_fields(self):
+        """Server-side tools may carry extra Anthropic-defined fields."""
+        tool = AnthropicTool(
+            type="web_search_20250305",
+            name="web_search",
+            max_uses=5,
+            allowed_domains=["docs.anthropic.com"],
+        )
+
+        assert tool.type == "web_search_20250305"
+        # extra="allow" preserves unknown fields on the model
+        dumped = tool.model_dump()
+        assert dumped["max_uses"] == 5
+        assert dumped["allowed_domains"] == ["docs.anthropic.com"]
+
+    def test_tool_rejects_missing_schema_and_type(self):
+        """Tool without input_schema or type is invalid."""
+        with pytest.raises(ValidationError):
+            AnthropicTool(name="broken")
+
+    def test_tool_with_only_input_schema_still_works(self):
+        """Regression: existing user-defined tool form still validates."""
+        tool = AnthropicTool(name="user_tool", input_schema={"type": "object"})
+
+        assert tool.input_schema == {"type": "object"}
+        assert tool.type is None
+
+    def test_messages_request_with_mixed_tools(self):
+        """MessagesRequest accepts mix of user tool and server-side tool."""
+        req = MessagesRequest(
+            model="claude-haiku-local",
+            max_tokens=128,
+            messages=[AnthropicMessage(role="user", content="hi")],
+            tools=[
+                AnthropicTool(name="get_weather", input_schema={"type": "object"}),
+                AnthropicTool(type="web_search_20250305", name="web_search"),
+            ],
+        )
+
+        assert len(req.tools) == 2
+        assert req.tools[0].input_schema == {"type": "object"}
+        assert req.tools[1].type == "web_search_20250305"
+
+    def test_token_count_request_with_server_side_tool(self):
+        """TokenCountRequest also accepts server-side tool definitions."""
+        req = TokenCountRequest(
+            model="claude-haiku-local",
+            messages=[AnthropicMessage(role="user", content="hi")],
+            tools=[AnthropicTool(type="web_search_20250305", name="web_search")],
+        )
+
+        assert len(req.tools) == 1
+        assert req.tools[0].type == "web_search_20250305"
 
 
 class TestToolChoice:

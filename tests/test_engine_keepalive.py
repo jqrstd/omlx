@@ -1,104 +1,112 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for embedding/reranker engine keepalive and mx.compile integration."""
+"""Tests for embedding/reranker engine mx.compile integration."""
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import mlx.core as mx
 import pytest
 
 
-class TestCompiledForwardWrapper:
-    """Tests for _CompiledForward wrapper class."""
+class _MaskBranchingModel:
+    """Forward with a Python `if` on a mask-dependent lazy comparison.
 
-    def test_compiled_forward_delegates_attributes(self):
-        """Wrapper should delegate attribute access to the inner module."""
-        from omlx.models.embedding import _CompiledForward
+    Mirrors mlx-embeddings qwen3's last_token_pool: with attention_mask=None
+    the default mask is built from the (static) shape, so it is a tracing
+    constant and legal to eval; with a traced attention_mask input the same
+    `if` forces an eval during tracing and mx.compile raises (issue #2447).
+    """
 
-        mock_module = MagicMock()
-        mock_module.config = MagicMock(hidden_size=384)
-        mock_module.__call__ = MagicMock(return_value="output")
+    def __call__(self, input_ids, attention_mask=None):
+        if attention_mask is None:
+            attention_mask = mx.ones(input_ids.shape, dtype=mx.int32)
+        left_padding = attention_mask[:, -1].sum() == attention_mask.shape[0]
+        if left_padding:
+            pooled = input_ids[:, -1:]
+        else:
+            pooled = input_ids[:, :1]
+        return SimpleNamespace(text_embeds=pooled.astype(mx.float32))
 
-        with patch("omlx.models.embedding.mx") as mock_mx:
-            mock_mx.compile.return_value = MagicMock(return_value="output")
-            wrapper = _CompiledForward(mock_module)
 
-        assert wrapper.config is mock_module.config
-        assert wrapper.config.hidden_size == 384
+class _MaskFreeModel:
+    """Forward with no data-dependent Python branching — compiles cleanly."""
 
-    def test_compiled_forward_call_uses_compiled(self):
-        """Wrapper __call__ should use the compiled function."""
-        from omlx.models.embedding import _CompiledForward
+    def __call__(self, input_ids, attention_mask=None):
+        if attention_mask is None:
+            attention_mask = mx.ones(input_ids.shape, dtype=mx.int32)
+        summed = (input_ids * attention_mask).sum(axis=1, keepdims=True)
+        return SimpleNamespace(text_embeds=summed.astype(mx.float32))
 
-        mock_module = MagicMock()
-        mock_compiled = MagicMock(return_value="compiled_output")
 
-        with patch("omlx.models.embedding.mx") as mock_mx:
-            mock_mx.compile.return_value = mock_compiled
-            wrapper = _CompiledForward(mock_module)
+class TestTryCompileMaskProbe:
+    """The compile probe must include a traced attention_mask (issue #2447).
 
-        result = wrapper("input1", key="val")
-        mock_compiled.assert_called_once_with("input1", key="val")
-        assert result == "compiled_output"
+    Real requests always carry one (prepare_inputs emits it), so a mask-less
+    probe can pass at load while every real request falls back to eager.
+    These tests run real mx.compile — no mocks — so they fail if the probe
+    stops representing the real request path.
+    """
+
+    def test_mask_branching_model_falls_back_at_load(self):
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel("test-model")
+        model.model = _MaskBranchingModel()
+
+        assert model._try_compile() is False
+        assert model._compiled_embed is None
+
+    def test_mask_free_model_still_compiles(self):
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel("test-model")
+        model.model = _MaskFreeModel()
+
+        assert model._try_compile() is True
+        assert model._compiled_embed is not None
 
 
 class TestTryCompile:
     """Tests for _try_compile in model wrappers."""
 
-    def test_try_compile_success(self):
-        """Should set _is_compiled=True on successful compilation."""
-        from omlx.models.embedding import MLXEmbeddingModel, _CompiledForward
+    def test_embedding_try_compile_success(self):
+        """_try_compile should return True and set _compiled_embed on success."""
+        from omlx.models.embedding import MLXEmbeddingModel
 
         model = MLXEmbeddingModel("test-model")
-        mock_raw_model = MagicMock()
-        mock_raw_model.__call__ = MagicMock(return_value=MagicMock())
-        model.model = mock_raw_model
+        model.model = MagicMock()
 
         with patch("omlx.models.embedding.mx") as mock_mx:
-            mock_mx.compile.return_value = MagicMock(return_value=MagicMock())
+            mock_compiled_fn = MagicMock(return_value=MagicMock())
+            mock_mx.compile.return_value = mock_compiled_fn
             mock_mx.zeros.return_value = MagicMock()
             mock_mx.int32 = "int32"
             result = model._try_compile()
 
         assert result is True
-        assert isinstance(model.model, _CompiledForward)
+        assert model._compiled_embed is mock_compiled_fn
 
-    def test_try_compile_failure_reverts(self):
-        """Should revert to original model on compilation failure."""
+    def test_embedding_try_compile_failure(self):
+        """_try_compile should return False and clear _compiled_embed on failure."""
         from omlx.models.embedding import MLXEmbeddingModel
 
         model = MLXEmbeddingModel("test-model")
-        original_model = MagicMock()
-        model.model = original_model
+        model.model = MagicMock()
 
         with patch("omlx.models.embedding.mx") as mock_mx:
             mock_mx.compile.side_effect = RuntimeError("compile failed")
             result = model._try_compile()
 
         assert result is False
-        assert model.model is original_model
+        assert model._compiled_embed is None
 
 
-class TestEmbeddingEngineKeepalive:
-    """Tests for keepalive integration in EmbeddingEngine."""
+class TestEmbeddingEngineStartStop:
+    """Tests for EmbeddingEngine start/stop lifecycle."""
 
-    def test_compiled_model_no_keepalive(self):
-        """Keepalive should NOT start if mx.compile succeeded."""
-        from omlx.engine.embedding import EmbeddingEngine
-
-        engine = EmbeddingEngine("test-model")
-
-        with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel:
-            mock_model = MagicMock()
-            mock_model._is_compiled = True
-            mock_model.hidden_size = 384
-            MockModel.return_value = mock_model
-
-            asyncio.run(engine.start())
-
-        assert engine._keepalive_task is None
-
-    def test_uncompiled_model_starts_keepalive(self):
-        """Keepalive SHOULD start if mx.compile failed."""
+    def test_engine_starts_without_keepalive(self):
+        """Engine should start without any background keepalive task."""
         from omlx.engine.embedding import EmbeddingEngine
 
         engine = EmbeddingEngine("test-model")
@@ -109,107 +117,25 @@ class TestEmbeddingEngineKeepalive:
             mock_model.hidden_size = 384
             MockModel.return_value = mock_model
 
-            async def _run():
-                await engine.start()
-                assert engine._keepalive_task is not None
-                await engine.stop()
+            asyncio.run(engine.start())
 
-            asyncio.run(_run())
-
-    def test_keepalive_stops_on_engine_stop(self):
-        """Keepalive task should be cancelled on engine stop."""
-        from omlx.engine.embedding import EmbeddingEngine
-
-        engine = EmbeddingEngine("test-model")
-
-        with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel:
-            mock_model = MagicMock()
-            mock_model._is_compiled = False
-            MockModel.return_value = mock_model
-
-            async def _run():
-                await engine.start()
-                assert engine._keepalive_task is not None
-                await engine.stop()
-                assert engine._keepalive_task is None
-
-            asyncio.run(_run())
-
-    def test_active_requests_tracking(self):
-        """_active_requests should be incremented during embed calls."""
-        from omlx.engine.embedding import EmbeddingEngine
-        from omlx.models.embedding import EmbeddingOutput
-
-        engine = EmbeddingEngine("test-model")
-
-        with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel:
-            mock_model = MagicMock()
-            mock_model._is_compiled = True
-            mock_model.embed.return_value = EmbeddingOutput(
-                embeddings=[[0.1]], total_tokens=1, dimensions=1,
-            )
-            MockModel.return_value = mock_model
-
-            async def _run():
-                await engine.start()
-                assert engine._active_requests == 0
-                await engine.embed(["test"])
-                assert engine._active_requests == 0  # Back to 0 after completion
-
-            asyncio.run(_run())
+        assert not hasattr(engine, "_keepalive_task")
 
 
-class TestRerankerEngineKeepalive:
-    """Tests for keepalive integration in RerankerEngine."""
+class TestRerankerEngineStartStop:
+    """Tests for RerankerEngine start/stop lifecycle."""
 
-    def test_compiled_model_no_keepalive(self):
-        """Keepalive should NOT start if mx.compile succeeded."""
+    def test_engine_starts_without_keepalive(self):
+        """Engine should start without any background keepalive task."""
         from omlx.engine.reranker import RerankerEngine
 
         engine = RerankerEngine("test-model")
 
         with patch("omlx.engine.reranker.MLXRerankerModel") as MockModel:
             mock_model = MagicMock()
-            mock_model._is_compiled = True
+            mock_model._is_compiled = False
             MockModel.return_value = mock_model
 
             asyncio.run(engine.start())
 
-        assert engine._keepalive_task is None
-
-    def test_uncompiled_model_starts_keepalive(self):
-        """Keepalive SHOULD start if mx.compile failed."""
-        from omlx.engine.reranker import RerankerEngine
-
-        engine = RerankerEngine("test-model")
-
-        with patch("omlx.engine.reranker.MLXRerankerModel") as MockModel:
-            mock_model = MagicMock()
-            mock_model._is_compiled = False
-            MockModel.return_value = mock_model
-
-            async def _run():
-                await engine.start()
-                assert engine._keepalive_task is not None
-                await engine.stop()
-
-            asyncio.run(_run())
-
-    def test_keepalive_stops_on_engine_stop(self):
-        """Keepalive task should be cancelled on engine stop."""
-        from omlx.engine.reranker import RerankerEngine
-
-        engine = RerankerEngine("test-model")
-
-        with patch("omlx.engine.reranker.MLXRerankerModel") as MockModel:
-            mock_model = MagicMock()
-            mock_model._is_compiled = False
-            MockModel.return_value = mock_model
-
-            async def _run():
-                await engine.start()
-                assert engine._keepalive_task is not None
-                await engine.stop()
-                assert engine._keepalive_task is None
-
-            asyncio.run(_run())
+        assert not hasattr(engine, "_keepalive_task")

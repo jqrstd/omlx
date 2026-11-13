@@ -13,7 +13,6 @@
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License">
   <img src="https://img.shields.io/badge/python-3.10+-green" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple" alt="Apple Silicon">
-  <a href="https://buymeacoffee.com/jundot"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?logo=buy-me-a-coffee&logoColor=black" alt="Buy Me a Coffee"></a>
 </p>
 
 <p align="center">
@@ -51,13 +50,14 @@
 
 ### macOSアプリ
 
-[Releases](https://github.com/jundot/omlx/releases)から`.dmg`をダウンロードし、Applicationsにドラッグするだけです。アプリ内自動アップデートに対応しているので、以降のアップグレードはワンクリックで完了します。
+[Releases](https://github.com/jundot/omlx/releases)から`.dmg`をダウンロードし、Applicationsにドラッグするだけです。アプリ内自動アップデートに対応しているので、以降のアップグレードはワンクリックで完了します。macOSアプリは軽量な`~/.omlx/bin/omlx` CLI shimもインストールするため、ターミナルコマンドやApple Shortcutsからアプリ管理のサーバーを制御できます。
 
 ### Homebrew
 
 ```bash
 brew tap jundot/omlx https://github.com/jundot/omlx
-brew install omlx
+brew install omlx --with-custom-kernel   # ネイティブカスタムカーネル込み（フルXcodeが必要）
+# フルXcodeがない場合は brew install omlx でカーネルなしでインストール
 
 # 最新バージョンへアップグレード
 brew update && brew upgrade omlx
@@ -65,8 +65,9 @@ brew update && brew upgrade omlx
 # バックグラウンドサービスとして実行（クラッシュ時に自動再起動）
 brew services start omlx
 
-# オプション: MCP（Model Context Protocol）サポート
+# オプション: MCP（Model Context Protocol）サポート。読み込むには再起動
 /opt/homebrew/opt/omlx/libexec/bin/pip install mcp
+omlx restart
 ```
 
 ### ソースからインストール
@@ -74,17 +75,24 @@ brew services start omlx
 ```bash
 git clone https://github.com/jundot/omlx.git
 cd omlx
-pip install -e .          # コアのみ
-pip install -e ".[mcp]"   # MCP（Model Context Protocol）サポート付き
+make install                # Web UIとネイティブカスタムカーネルを含むeditableインストール
+# フルXcodeがない場合は make install-no-kernels でカーネルなしでインストール
+make mcp                    # オプション: MCP サポートを追加。`omlx serve` の再起動で読み込み
 ```
 
-Python 3.10+とApple Silicon（M1/M2/M3/M4）が必要です。
+macOS 15.0+（Sequoia）、Python 3.11–3.13、Apple Silicon（M1/M2/M3/M4/M5）が必要です。
+
+> **ネイティブカスタムカーネルについて:** GLM-5.2、MiniMax M3、Qwen3.5にはカーネルが必要で、ないと警告なしにかなり遅い汎用パスにフォールバックします。`make install`はカーネルもビルドし、すべて読み込めるか確認します。これにはMetalツールチェーン入りのフルXcodeが必要です（`xcodebuild -downloadComponent MetalToolchain`）。Command Line Toolsだけでは足りません。Xcodeがない場合は、カーネルがコンパイル済みで同梱されている公式DMGを使うか、`make install-no-kernels`を使ってください。`make kernels`はカーネルだけを最初からビルドし直します。インストールの確認:
+>
+> ```bash
+> python -c "from omlx.custom_kernels import native_kernel_status; print(native_kernel_status())"
+> ```
 
 ## クイックスタート
 
 ### macOSアプリ
 
-ApplicationsフォルダからoMLXを起動します。ウェルカム画面が3つのステップを案内します — モデルディレクトリの設定、サーバー起動、最初のモデルダウンロード。以上です。
+ApplicationsフォルダからoMLXを起動します。ウェルカム画面が3つのステップを案内します — モデルディレクトリの設定、サーバー起動、最初のモデルダウンロード。以上です。OpenClaw、OpenCode、Codex、Hermes Agent、Copilot、DeepSeek Harnessに接続するには、[統合](#統合)を参照してください。
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.36.32.png" alt="oMLX ウェルカム画面" width="360">
@@ -122,7 +130,7 @@ Apple SiliconでテキストLLM、ビジョン言語モデル（VLM）、OCRモ�
 
 ### 管理画面
 
-`/admin`でリアルタイム監視、モデル管理、チャット、ベンチマーク、モデル別設定のためのWeb UIを提供します。英語、韓国語、日本語、中国語に対応。すべてのCDN依存関係がバンドルされ、完全オフラインでの運用が可能です。
+`/admin`でリアルタイム監視、モデル管理、チャット、ベンチマーク、モデル別設定のためのWeb UIを提供します。英語、韓国語、日本語、中国語、ロシア語に対応。すべてのCDN依存関係がバンドルされ、完全オフラインでの運用が可能です。
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.45.34.png" alt="oMLX 管理画面" width="720">
@@ -145,11 +153,11 @@ vLLMにインスパイアされたブロックベースのKVキャッシュ管�
 
 ### 連続バッチング
 
-mlx-lmのBatchGeneratorを通じて同時リクエストを処理します。プリフィルとコンプリーションのバッチサイズは設定可能です。
+mlx-lmのBatchGeneratorを通じて同時リクエストを処理します。最大同時リクエスト数はCLIまたは管理パネルで設定できます。
 
 ### Claude Code最適化
 
-Claude Codeで小さなコンテキストモデルを実行するためのコンテキストスケーリングをサポートします。報告されるトークン数をスケーリングすることで自動圧縮が適切なタイミングでトリガーされ、長いプリフィル中の読み取りタイムアウトを防ぐSSE keep-aliveを提供します。
+Claude Codeで小さなコンテキストモデルを実行するため、トークン数をスケーリングする代わりにモデルの実際のコンテキストウィンドウで自動圧縮を制御し、長いプリフィル中の読み取りタイムアウトを防ぐSSE keep-aliveを提供します。
 
 ### マルチモデルサービング
 
@@ -167,6 +175,7 @@ Claude Codeで小さなコンテキストモデルを実行するためのコン
 
 - **モデルエイリアス**: カスタムAPI表示名を設定します。`/v1/models`でエイリアスが返され、リクエスト時にエイリアスとディレクトリ名の両方が使用可能です。
 - **モデルタイプオーバーライド**: 自動検出に関係なく、LLMまたはVLMとして手動設定します。
+- **プロファイル**: モデルごとの設定に名前を付けて保存し、管理画面から切り替えられます。プロファイルは任意で独立したモデルとして公開できます：`/v1/models` に `<モデル>:<プロファイル>`（例：`qwen3-8b:thinking`）も表示され、ベースモデルと同じエンジン上でプロファイルの設定をリクエストごとに上書きして動作します — 追加のメモリやリロードは不要です。ベースモデルにエイリアスがある場合、公開IDは `<エイリアス>:<プロファイル>` として表示されます。ディレクトリ名の形式もベースモデルと同様に引き続き使用できます。
 
 <p align="center">
   <img src="docs/images/omlx_ChatTemplateKwargs.png" alt="oMLX チャットテンプレート引数" width="480">
@@ -183,10 +192,18 @@ Claude Codeで小さなコンテキストモデルを実行するためのコン
 
 ### モデルダウンロード
 
-管理画面からHuggingFaceのMLXモデルを直接検索してダウンロードします。モデルカードの確認、ファイルサイズの確認、ワンクリックダウンロードが可能です。
+管理画面からHuggingFaceのモデルをMLX、GGUF、またはすべての形式で直接検索してダウンロードします。モデルカードを確認してからダウンロードするファイルを選べます。MLXチェックポイントは必要なファイルを常にダウンロードし、GGUFはvision projectorも一緒にダウンロードします。
 
 <p align="center">
   <img src="docs/images/downloader_omlx.png" alt="oMLX モデルダウンロード" width="720">
+</p>
+
+### 統合
+
+管理画面からOpenClaw、OpenCode、Codex、Hermes Agent、Copilot、Pi、DeepSeek Harnessをワンクリックで設定できます。設定ファイルを手動で編集する必要はありません。
+
+<p align="center">
+  <img src="docs/images/omlx_integrations.png" alt="oMLX 統合" width="720">
 </p>
 
 ### パフォーマンスベンチマーク
@@ -199,7 +216,7 @@ Claude Codeで小さなコンテキストモデルを実行するためのコン
 
 ### macOSメニューバーアプリ
 
-ネイティブPyObjCメニューバーアプリ（Electronではありません）。ターミナルを開かずにサーバーの起動、停止、監視が可能です。永続的な配信統計（再起動後も維持）、クラッシュ時の自動再起動、アプリ内自動アップデートを含みます。
+ネイティブ Swift / SwiftUI メニューバーアプリ（Electron ではありません）。ターミナルを開かずにサーバーの起動、停止、監視が可能です。永続的な配信統計（再起動後も維持）、クラッシュ時の自動再起動、Sparkle による自動アップデートを含みます。
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.51.54.png" alt="oMLX メニューバー統計" width="400">
@@ -207,7 +224,7 @@ Claude Codeで小さなコンテキストモデルを実行するためのコン
 
 ### API互換性
 
-OpenAIとAnthropic APIのドロップイン代替です。ストリーミング使用統計（`stream_options.include_usage`）、Anthropic adaptive thinking、ビジョン入力（base64、URL）をサポートします。
+OpenAIとAnthropic APIのドロップイン代替です。ストリーミング使用統計（`stream_options.include_usage`）、llama.cpp互換のprefill進捗（`return_progress`）、Anthropic adaptive thinking、ビジョン入力（base64、URL）をサポートします。
 
 | エンドポイント | 説明 |
 |----------|------|
@@ -216,7 +233,11 @@ OpenAIとAnthropic APIのドロップイン代替です。ストリーミング�
 | `POST /v1/messages` | Anthropic Messages API |
 | `POST /v1/embeddings` | テキストエンベディング |
 | `POST /v1/rerank` | ドキュメントリランキング |
+| `POST /v1/systemone` | Decision モデルまたはチャットモデルによる型付き判定 (TypeSafe System One) |
 | `GET /v1/models` | 利用可能なモデル一覧 |
+| `POST /tokenize`, `POST /detokenize` | vLLM 互換トークナイザー API（`/v1` 配下でも利用可） |
+
+設定、モデル、ダウンロード、量子化、ベンチマークを扱う管理APIは、メインAPIキーをBearerトークンとして受け付け、headlessモードでも動作します。[Admin API](docs/admin-api.md)を参照してください。
 
 ### ツール呼び出し＆構造化出力
 
@@ -253,10 +274,11 @@ mlx-lmで利用可能なすべての関数呼び出し形式、JSONスキーマ�
 | タイプ | モデル |
 |------|------|
 | LLM | [mlx-lm](https://github.com/ml-explore/mlx-lm)がサポートするすべてのモデル |
-| VLM | Qwen3.5シリーズ、GLM-4V、Pixtralおよびその他の[mlx-vlm](https://github.com/Blaizzy/mlx-vlm)モデル |
+| VLM | Qwen3.5シリーズ、GLM-4V、Pixtralおよびその他の[mlx-vlm](https://github.com/Neywa-Labs/mlx-vlm)モデル |
 | OCR | DeepSeek-OCR、DOTS-OCR、GLM-OCR |
-| エンベディング | BERT、BGE-M3、ModernBERT |
+| エンベディング | BERT、BGE-M3、ModernBERT、EmbeddingGemma 2 |
 | リランカー | ModernBERT、XLM-RoBERTa |
+| Decision | Clef、Clef-Flash、OpenJev、Decision 3.0 (d3, d3-flash, d3-mini, d3-nano, d3-lite, d3-edge) |
 
 ## CLI 設定
 
@@ -273,8 +295,8 @@ omlx serve --model-dir ~/models --paged-ssd-cache-dir ~/.omlx/cache
 # メモリ内ホットキャッシュサイズの設定
 omlx serve --model-dir ~/models --hot-cache-max-size 20%
 
-# バッチサイズの調整
-omlx serve --model-dir ~/models --prefill-batch-size 8 --completion-batch-size 32
+# 最大同時リクエスト数の調整（デフォルト: 8）
+omlx serve --model-dir ~/models --max-concurrent-requests 16
 
 # MCPツールの使用
 omlx serve --model-dir ~/models --mcp-config mcp.json
@@ -282,6 +304,9 @@ omlx serve --model-dir ~/models --mcp-config mcp.json
 # APIキー認証
 omlx serve --model-dir ~/models --api-key your-secret-key
 # Localhost専用: 管理画面のグローバル設定で検証をスキップ
+
+# Web UIなしで推論・管理APIのみ起動（設定には保存されません）
+omlx serve --model-dir ~/models --headless
 ```
 
 すべての設定は`/admin`のWeb管理画面からも設定できます。設定は`~/.omlx/settings.json`に保存され、CLIフラグが優先されます。
@@ -296,11 +321,12 @@ FastAPI Server (OpenAI / Anthropic API)
     │   ├── BatchedEngine (LLM、連続バッチング)
     │   ├── VLMEngine (ビジョン言語モデル)
     │   ├── EmbeddingEngine
-    │   └── RerankerEngine
+    │   ├── RerankerEngine
+    │   └── DecisionEngine
     │
     ├── ProcessMemoryEnforcer (合計メモリ制限、TTLチェック)
     │
-    ├── Scheduler (FCFS、設定可能なバッチサイズ)
+    ├── Scheduler (FCFS、設定可能な同時処理数)
     │   └── mlx-lm BatchGenerator
     │
     └── Cache Stack
@@ -313,33 +339,49 @@ FastAPI Server (OpenAI / Anthropic API)
 
 ## 開発
 
+### ビルドコマンド
+
+| コマンド | 内容 |
+|---|---|
+| `make install` | サーバーとWeb UIをeditableインストールし、ネイティブカスタムカーネルもビルド |
+| `make install-no-kernels` | カーネルなしで同じインストール（フルXcodeがない環境向け） |
+| `make mcp` | MCP（Model Context Protocol）サポートを追加 |
+| `make dev` | `make install`と同じで開発ツール付き（`make dev-no-kernels`はカーネルなし） |
+| `make kernels` | 既存のネイティブカスタムカーネルのビルドを削除して再コンパイルし、すべて読み込めるか確認 |
+| `make web` | Web UIのCSSを再ビルドし、翻訳ファイルを正規化 |
+| `make app` | ネイティブカスタムカーネルを新しくコンパイルして含めた`oMLX.app`をステージング |
+
+ネイティブカスタムカーネルのビルドにはMetalツールチェーン入りのフルXcodeが必要です（`xcodebuild -downloadComponent MetalToolchain`）。
+
 ### CLIサーバー
 
 ```bash
 git clone https://github.com/jundot/omlx.git
 cd omlx
-pip install -e ".[dev]"
+make dev
 pytest -m "not slow"
 ```
 
+### Web UI
+
+Web管理UIは`apps/omlx-web/`にあり、同じパッケージに含まれるため`make dev`で一緒にインストールされます。テンプレート、JavaScript、翻訳を編集したら`make web`でCSSを再ビルドし、翻訳ファイルを正規化してください。
+
 ### macOSアプリ
 
-Python 3.11+と[venvstacks](https://venvstacks.lmstudio.ai)（`pip install venvstacks`）が必要です。
+ネイティブ SwiftUI アプリは `apps/omlx-mac/` にあります。Xcode 26.5+ と Python 3.11+ が必要です。venvstacks は dev 依存として宣言されているため、`make dev`（または `uv sync --dev`）でピン留めされたバージョンが入ります。ホスト全体のツールランナーを使いたい場合は `uvx venvstacks` や `pipx run venvstacks` でも動作します。
 
 ```bash
-cd packaging
+# 実行可能な oMLX.app をステージング（xcodebuild + venvstacks Python レイヤー + ネイティブカーネル + ad-hoc 署名）
+make app
 
-# フルビルド（venvstacks + アプリバンドル + DMG）
-python build.py
+# 出力は apps/omlx-mac/build/Stage/oMLX.app
+open apps/omlx-mac/build/Stage/oMLX.app
 
-# venvstacksをスキップ（コード変更のみ）
-python build.py --skip-venv
-
-# DMGのみ
-python build.py --dmg-only
+# venvstacks を強制的に再ビルド（通常は fingerprint でキャッシュ）
+apps/omlx-mac/Scripts/build.sh release --rebuild-donor
 ```
 
-アプリバンドルの構造とレイヤー設定の詳細は[packaging/README.md](packaging/README.md)を参照してください。
+初回 cold ビルドは 10–20 分かかります（venvstacks Python レイヤーの組み立て）。以降のビルドは `packaging/_export/` のキャッシュを再利用し、約 4 分で完了します。レイヤー構成は [packaging/README.md](packaging/README.md)、Swift ソースは [apps/omlx-mac/](apps/omlx-mac/) を参照してください。
 
 ## コントリビューション
 
@@ -356,7 +398,8 @@ python build.py --dmg-only
 ## 謝辞
 
 - [MLX](https://github.com/ml-explore/mlx)と[mlx-lm](https://github.com/ml-explore/mlx-lm) by Apple
-- [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) - Apple Siliconでのビジョン言語モデル推論
+- [mlx-vlm](https://github.com/Neywa-Labs/mlx-vlm) - Apple Siliconでのビジョン言語モデル推論
 - [vllm-mlx](https://github.com/waybarrios/vllm-mlx) - oMLXはvllm-mlx v0.1.0からスタートし、マルチモデルサービング、階層型KVキャッシュ、完全なページドキャッシュ対応のVLM、管理画面、macOSメニューバーアプリへと大きく進化しました
 - [venvstacks](https://venvstacks.lmstudio.ai) - macOSアプリバンドルのためのポータブルPython環境レイヤリング
 - [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Apple Silicon向けエンベディングモデルサポート
+- [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) - Apple Siliconでのブロック拡散 speculative decoding

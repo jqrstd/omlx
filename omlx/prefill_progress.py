@@ -28,20 +28,34 @@ class PrefillProgressTracker:
     def __init__(self) -> None:
         self._progress: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.Lock()
+        self._last_activity_ts = 0.0
 
-    def update(self, request_id: str, processed: int, total: int, model_id: str) -> None:
-        """Update prefill progress for a request.
+    def update(
+        self,
+        request_id: str,
+        processed: int,
+        total: int,
+        model_id: str,
+        phase: str = "prefill",
+        detail: Optional[str] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Update prefill/spec-prefill progress for a request.
 
         Auto-removes the entry when processed >= total (prefill complete).
-        Tracks timing for speed/ETA calculation.
+        Tracks phase timing for speed/ETA calculation.
         """
         now = time.monotonic()
         with self._lock:
+            self._last_activity_ts = now
             if processed >= total:
                 self._progress.pop(request_id, None)
             else:
                 prev = self._progress.get(request_id)
-                if prev is not None:
+                phase_changed = prev is not None and prev.get("phase") != phase
+                start_time = now if prev is None or phase_changed else prev["start_time"]
+
+                if prev is not None and not phase_changed:
                     dt = now - prev["last_time"]
                     dtok = processed - prev["processed"]
                     if dt > 0 and dtok > 0:
@@ -51,19 +65,58 @@ class PrefillProgressTracker:
                 else:
                     speed = 0.0
 
-                self._progress[request_id] = {
-                    "processed": processed,
-                    "total": total,
-                    "model_id": model_id,
-                    "start_time": prev["start_time"] if prev else now,
-                    "last_time": now,
-                    "speed": speed,
-                }
+                entry = dict(extra or {})
+                entry.update(
+                    {
+                        "processed": processed,
+                        "total": total,
+                        "model_id": model_id,
+                        "start_time": start_time,
+                        "last_time": now,
+                        "speed": speed,
+                        "phase": phase,
+                        "detail": detail,
+                    }
+                )
+                self._progress[request_id] = entry
 
     def remove(self, request_id: str) -> None:
         """Explicitly remove a request (e.g. on abort or finish)."""
         with self._lock:
-            self._progress.pop(request_id, None)
+            if self._progress.pop(request_id, None) is not None:
+                self._last_activity_ts = time.monotonic()
+
+    def get(self, request_id: str) -> Optional[Dict[str, Any]]:
+        """Return a copy of one request's raw entry, or None."""
+        with self._lock:
+            entry = self._progress.get(request_id)
+            return dict(entry) if entry is not None else None
+
+    def recently_active(self, within_s: float) -> bool:
+        """True while any prefill is live, or within ``within_s`` of the
+        last prefill activity (update, completion, or abort).
+
+        A prefill that just ended counts as recent activity on purpose:
+        timings sampled right after it are still contention-shaped.
+        """
+        now = time.monotonic()
+        with self._lock:
+            if self._progress:
+                return True
+            return (now - self._last_activity_ts) < within_s
+
+    def active_since(self, since_ts: float) -> bool:
+        """True while any prefill is live, or when prefill activity (update,
+        completion, or abort) happened after the monotonic time ``since_ts``.
+
+        Unlike ``recently_active`` this scopes the question to a window the
+        caller owns, so a prefill that ended before it (for example the
+        request's own prompt) does not count.
+        """
+        with self._lock:
+            if self._progress:
+                return True
+            return self._last_activity_ts > float(since_ts)
 
     def get_model_progress(self, model_id: str) -> List[Dict[str, Any]]:
         """Return list of prefilling requests for a given model."""
@@ -72,22 +125,39 @@ class PrefillProgressTracker:
             for rid, entry in self._progress.items():
                 if entry["model_id"] != model_id:
                     continue
-                remaining = entry["total"] - entry["processed"]
+                elapsed = time.monotonic() - entry["start_time"]
                 speed = entry.get("speed", 0.0)
+                remaining = entry["total"] - entry["processed"]
                 eta = remaining / speed if speed > 0 else None
-                results.append({
+                result = {
                     "request_id": rid,
                     "processed": entry["processed"],
                     "total": entry["total"],
                     "speed": round(speed, 1),
                     "eta": round(eta, 1) if eta is not None else None,
-                })
+                    "elapsed": round(elapsed, 1),
+                    "phase": entry.get("phase", "prefill"),
+                    "detail": entry.get("detail"),
+                }
+                for key in (
+                    "scored_tokens",
+                    "selected_tokens",
+                    "keep_percent",
+                    "prompt_tokens",
+                    "system_tokens",
+                    "conversation_tokens",
+                    "cached_tokens",
+                ):
+                    if key in entry:
+                        result[key] = entry[key]
+                results.append(result)
             return results
 
     def clear(self) -> None:
-        """Remove all entries."""
+        """Remove all entries and forget the last activity timestamp."""
         with self._lock:
             self._progress.clear()
+            self._last_activity_ts = 0.0
 
 
 # Module-level singleton, lazily created.

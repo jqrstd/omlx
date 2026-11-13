@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pydantic models for the OpenAI Responses API (/v1/responses)."""
 
+import json
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_serializer, model_validator
 
 from .shared_models import IDPrefix, generate_id, get_unix_timestamp
 
@@ -31,11 +32,27 @@ class InputItem(BaseModel):
     name: Optional[str] = None
     arguments: Optional[str] = None
     # function_call_output fields
-    output: Optional[str] = None
+    output: Optional[Union[str, List[Any], Dict[str, Any]]] = None
     # status field (present on many item types)
     status: Optional[str] = None
 
     model_config = {"extra": "allow"}
+
+    @model_validator(mode="before")
+    @classmethod
+    def _serialize_complex_output(cls, data: Any) -> Any:
+        """Serialize dict output to JSON string for compatibility.
+
+        Agent frameworks may send dict tool outputs. Convert them to JSON
+        strings so downstream code that expects ``str`` keeps working. List
+        outputs pass through unchanged so multimodal parts (e.g. images)
+        stay extractable for VLM processing during message conversion.
+        """
+        if isinstance(data, dict):
+            output = data.get("output")
+            if isinstance(output, dict):
+                data = {**data, "output": json.dumps(output)}
+        return data
 
 
 class ResponsesTool(BaseModel):
@@ -83,7 +100,7 @@ class ResponsesRequest(BaseModel):
     instructions: Optional[str] = None
     temperature: Optional[float] = None
     top_p: Optional[float] = None
-    max_output_tokens: Optional[int] = None
+    max_output_tokens: Optional[int] = Field(default=None, gt=0)
     stream: bool = False
     tools: Optional[List[ResponsesTool]] = None
     tool_choice: Optional[Union[str, Dict[str, Any]]] = None
@@ -105,6 +122,10 @@ class ResponsesRequest(BaseModel):
     conversation: Optional[Any] = None
     max_tool_calls: Optional[int] = None
     stream_options: Optional[Dict[str, Any]] = None
+    # Seed for reproducible generation (best-effort)
+    seed: Optional[int] = None
+    # Chat template kwargs (e.g. enable_thinking, reasoning_effort)
+    chat_template_kwargs: Optional[Dict[str, Any]] = None
 
     model_config = {"extra": "allow"}
 
@@ -122,13 +143,20 @@ class OutputContent(BaseModel):
     annotations: List[Any] = Field(default_factory=list)
 
 
+class ReasoningSummaryPart(BaseModel):
+    """A single part of a reasoning summary."""
+
+    type: str = "summary_text"
+    text: str = ""
+
+
 class OutputItem(BaseModel):
     """A single item in the response output array.
 
-    Can be a message or a function_call.
+    Can be a message, function_call, or reasoning.
     """
 
-    type: str  # "message" or "function_call"
+    type: str  # "message" or "function_call" or "reasoning"
     id: str
     status: str = "completed"
     # message fields
@@ -138,6 +166,25 @@ class OutputItem(BaseModel):
     call_id: Optional[str] = None
     name: Optional[str] = None
     arguments: Optional[str] = None
+    # Set when the call came from a "namespace" tool group; clients resolve
+    # such a call by (namespace, name).
+    namespace: Optional[str] = None
+    # reasoning fields
+    summary: Optional[List[ReasoningSummaryPart]] = None
+
+    @model_serializer(mode="wrap")
+    def _drop_unset_namespace(self, handler):
+        """Keep ``namespace`` off the items that have none; other fields as-is."""
+        data = handler(self)
+        if data.get("namespace") is None:
+            data.pop("namespace", None)
+        return data
+
+
+class InputTokensDetails(BaseModel):
+    """Details about input token usage."""
+
+    cached_tokens: int = 0
 
 
 class OutputTokensDetails(BaseModel):
@@ -152,6 +199,9 @@ class ResponseUsage(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
+    input_tokens_details: InputTokensDetails = Field(
+        default_factory=InputTokensDetails
+    )
     output_tokens_details: OutputTokensDetails = Field(
         default_factory=OutputTokensDetails
     )
@@ -185,3 +235,4 @@ class ResponseObject(BaseModel):
     metadata: Optional[Dict[str, str]] = Field(default_factory=dict)
     truncation: Optional[str] = None
     error: Optional[Dict[str, Any]] = None
+    incomplete_details: Optional[Dict[str, str]] = None

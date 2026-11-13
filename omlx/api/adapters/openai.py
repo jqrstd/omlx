@@ -26,6 +26,7 @@ from ..openai_models import (
     ChatCompletionChunkDelta,
     ChatCompletionRequest,
     ChatCompletionResponse,
+    PromptTokensDetails,
     Usage,
 )
 from ..thinking import extract_thinking
@@ -108,7 +109,9 @@ class OpenAIAdapter(BaseAdapter):
         """
         # Separate thinking from content
         raw_text = clean_special_tokens(response.text) if response.text else ""
-        thinking_content, regular_content = extract_thinking(raw_text)
+        thinking_content, regular_content = extract_thinking(
+            raw_text, truncated=response.finish_reason == "length"
+        )
         content = regular_content.strip() if regular_content else None
 
         # Determine finish reason
@@ -133,6 +136,9 @@ class OpenAIAdapter(BaseAdapter):
                 prompt_tokens=response.prompt_tokens,
                 completion_tokens=response.completion_tokens,
                 total_tokens=response.prompt_tokens + response.completion_tokens,
+                prompt_tokens_details=PromptTokensDetails(
+                    cached_tokens=response.cached_tokens,
+                ),
             ),
         )
 
@@ -180,6 +186,9 @@ class OpenAIAdapter(BaseAdapter):
                 prompt_tokens=chunk.prompt_tokens,
                 completion_tokens=chunk.completion_tokens,
                 total_tokens=chunk.prompt_tokens + chunk.completion_tokens,
+                prompt_tokens_details=PromptTokensDetails(
+                    cached_tokens=chunk.cached_tokens,
+                ),
             )
 
         return f"data: {response.model_dump_json(exclude_none=True)}\n\n"

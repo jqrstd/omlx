@@ -12,13 +12,24 @@ from omlx.model_settings import ModelSettings
 class TestGetMaxContextWindow:
     """Tests for get_max_context_window() priority logic."""
 
-    def _make_server_state(self, global_max_ctx=32768):
-        """Create a mock server state with given global max_context_window."""
+    def _make_server_state(
+        self, global_max_ctx=32768, policy_cap=None
+    ):
+        """Create a mock server state with given global
+        ``max_context_window`` fallback and optional
+        ``max_context_window_policy`` cap."""
         from omlx.server import SamplingDefaults
 
         state = MagicMock()
-        state.sampling = SamplingDefaults(max_context_window=global_max_ctx)
+        state.sampling = SamplingDefaults(
+            max_context_window=global_max_ctx,
+            max_context_window_policy=policy_cap,
+        )
         state.settings_manager = None
+        # Discovery-tier (#1308) lookups are exercised in TestGetMaxContextWindow
+        # in test_server.py; nulling the pool here keeps these focused on the
+        # per-model-setting → global fallback path.
+        state.engine_pool = None
         return state
 
     def test_returns_global_default(self):
@@ -36,7 +47,7 @@ class TestGetMaxContextWindow:
 
         state = self._make_server_state(global_max_ctx=32768)
         mock_manager = MagicMock()
-        mock_manager.get_settings.return_value = ModelSettings(
+        mock_manager.get_settings_for_request.return_value = ModelSettings(
             max_context_window=4096
         )
         state.settings_manager = mock_manager
@@ -51,7 +62,7 @@ class TestGetMaxContextWindow:
 
         state = self._make_server_state(global_max_ctx=65536)
         mock_manager = MagicMock()
-        mock_manager.get_settings.return_value = ModelSettings(
+        mock_manager.get_settings_for_request.return_value = ModelSettings(
             max_context_window=None
         )
         state.settings_manager = mock_manager
@@ -68,6 +79,115 @@ class TestGetMaxContextWindow:
         with patch("omlx.server._server_state", state):
             result = get_max_context_window(None)
             assert result == 16384
+
+    def _mount_native_and_policy(
+        self, native_ctx: int | None, policy_cap: int | None
+    ):
+        """Mount a server state with a model that has the given native
+        context length, the policy field set to ``policy_cap``, and no
+        per-model override."""
+        state = self._make_server_state(
+            global_max_ctx=32768, policy_cap=policy_cap
+        )
+        mock_manager = MagicMock()
+        mock_manager.get_settings_for_request.return_value = ModelSettings(
+            max_context_window=None
+        )
+        state.settings_manager = mock_manager
+
+        mock_pool = MagicMock()
+        mock_entry = MagicMock()
+        mock_entry.model_context_length = native_ctx
+        mock_pool.get_entry.return_value = mock_entry
+        state.engine_pool = mock_pool
+        return state
+
+    def test_policy_unset_native_wins_unchanged(self):
+        """With ``max_context_window_policy`` unset, the model's
+        native context length is returned verbatim — existing
+        installs see no behavior change after this PR."""
+        from omlx.server import get_max_context_window
+
+        state = self._mount_native_and_policy(
+            native_ctx=262_144, policy_cap=None
+        )
+        with patch("omlx.server._server_state", state):
+            assert get_max_context_window("big-model") == 262_144
+
+    def test_policy_set_clamps_native(self):
+        """With ``max_context_window_policy=128_000`` and a model that
+        natively declares 256 K, the effective cap is the policy."""
+        from omlx.server import get_max_context_window
+
+        state = self._mount_native_and_policy(
+            native_ctx=262_144, policy_cap=128_000
+        )
+        with patch("omlx.server._server_state", state):
+            assert get_max_context_window("big-model") == 128_000, (
+                "Policy of 128k must clamp a model that natively declares 256k"
+            )
+
+    def test_policy_set_native_below_policy_wins(self):
+        """When the model's native length is already below the policy,
+        the native value wins — policy is a ceiling, not a floor."""
+        from omlx.server import get_max_context_window
+
+        state = self._mount_native_and_policy(
+            native_ctx=32_768, policy_cap=128_000
+        )
+        with patch("omlx.server._server_state", state):
+            assert get_max_context_window("small-model") == 32_768
+
+    def test_per_model_override_escapes_policy(self):
+        """A per-model override is the operator's explicit per-model
+        choice; the global policy cap does NOT clamp it. This is the
+        operator's escape hatch for individual models that should
+        exceed the policy."""
+        from omlx.server import get_max_context_window
+
+        state = self._mount_native_and_policy(
+            native_ctx=100_000, policy_cap=64_000
+        )
+        # Add a per-model override above both native and policy
+        state.settings_manager = MagicMock()
+        state.settings_manager.get_settings_for_request.return_value = ModelSettings(
+            max_context_window=200_000
+        )
+        with patch("omlx.server._server_state", state):
+            assert get_max_context_window("override-model") == 200_000, (
+                "Per-model override must escape the policy clamp"
+            )
+
+    def test_policy_does_not_apply_to_fallback_path(self):
+        """When the model has no discoverable native context AND no
+        per-model override, the fallback default applies — the policy
+        is documented as clamping the *native* path only. Existing
+        ``settings.json`` files with the historical 32768 fallback
+        therefore keep working unchanged even when a policy is later
+        added to the install."""
+        from omlx.server import get_max_context_window
+
+        # native_ctx=None: model config doesn't expose a context length
+        state = self._mount_native_and_policy(
+            native_ctx=None, policy_cap=16_000
+        )
+        with patch("omlx.server._server_state", state):
+            # Fallback (32768) returned, not the policy (16_000).
+            assert get_max_context_window("no-native-model") == 32_768
+
+    def test_loaded_engine_plan_lowers_the_limit(self):
+        """An engine that fits its context to memory (Splash) caps the limit,
+        so a longer prompt gets the standard overflow error from oMLX."""
+        from omlx.server import get_max_context_window
+
+        state = self._mount_native_and_policy(native_ctx=262_144, policy_cap=None)
+        engine = state.engine_pool.get_entry.return_value.engine
+        engine.max_context_tokens = 77_817
+        with patch("omlx.server._server_state", state):
+            assert get_max_context_window("splash-model") == 77_817
+        engine.max_context_tokens = 300_000
+        with patch("omlx.server._server_state", state):
+            assert get_max_context_window("splash-model") == 262_144
 
 
 class TestValidateContextWindow:
@@ -107,9 +227,12 @@ class TestValidateContextWindow:
         with patch("omlx.server._server_state", state):
             with pytest.raises(HTTPException) as exc_info:
                 validate_context_window(1001)
+            # Overflow markers that clients match before compacting.
+            detail = exc_info.value.detail.lower()
             assert exc_info.value.status_code == 400
-            assert "1001 tokens" in exc_info.value.detail
-            assert "1000 tokens" in exc_info.value.detail
+            assert exc_info.value.code == "context_length_exceeded"
+            assert "prompt is too long: 1001 tokens > 1000" in detail
+            assert "maximum context length" in detail
 
     def test_raises_with_model_specific_limit(self):
         """Test uses model-specific limit when available."""
@@ -117,7 +240,7 @@ class TestValidateContextWindow:
 
         state = self._make_server_state(global_max_ctx=32768)
         mock_manager = MagicMock()
-        mock_manager.get_settings.return_value = ModelSettings(
+        mock_manager.get_settings_for_request.return_value = ModelSettings(
             max_context_window=100
         )
         state.settings_manager = mock_manager
@@ -126,8 +249,7 @@ class TestValidateContextWindow:
             with pytest.raises(HTTPException) as exc_info:
                 validate_context_window(200, "test-model")
             assert exc_info.value.status_code == 400
-            assert "200 tokens" in exc_info.value.detail
-            assert "100 tokens" in exc_info.value.detail
+            assert "200 tokens > 100" in exc_info.value.detail
 
 
 class TestCountChatTokens:
@@ -176,3 +298,41 @@ class TestCountChatTokens:
         count = engine.count_chat_tokens(messages, tools)
 
         assert count == 7
+
+
+class TestGetRerankMaxLength:
+    """get_rerank_max_length() mirrors get_embedding_max_length but must not
+    consult the LLM-oriented global sampling default: only an explicit request
+    or the model's own per-model max_context_window override applies."""
+
+    def test_request_value_wins(self):
+        from omlx.server import get_rerank_max_length
+
+        with patch("omlx.server.get_model_settings_for_request") as gm:
+            assert get_rerank_max_length("m", 1024) == 1024
+            gm.assert_not_called()
+
+    def test_per_model_override_applies(self):
+        from omlx.server import get_rerank_max_length
+
+        settings = ModelSettings(max_context_window=4096)
+        with patch(
+            "omlx.server.get_model_settings_for_request", return_value=settings
+        ):
+            assert get_rerank_max_length("m") == 4096
+
+    def test_no_override_defers_to_model_default(self):
+        """None lets the reranker resolve its own declared model_max_length."""
+        from omlx.server import get_rerank_max_length
+
+        with patch(
+            "omlx.server.get_model_settings_for_request",
+            return_value=ModelSettings(max_context_window=None),
+        ):
+            assert get_rerank_max_length("m") is None
+
+    def test_missing_settings_defers_to_model_default(self):
+        from omlx.server import get_rerank_max_length
+
+        with patch("omlx.server.get_model_settings_for_request", return_value=None):
+            assert get_rerank_max_length("m") is None

@@ -22,6 +22,7 @@ class TestListModelsSettings:
     def test_list_models_includes_all_model_settings_fields(self):
         """Ensure list_models response includes all ModelSettings fields."""
         mock_engine_pool = MagicMock()
+        mock_engine_pool.splash_target.return_value = (None, "")
         mock_engine_pool.get_status.return_value = {
             "models": [
                 {
@@ -80,6 +81,189 @@ class TestListModelsSettings:
         assert settings_dict["max_context_window"] == 8192
         assert settings_dict["max_tokens"] == 4096
         assert settings_dict["temperature"] == 0.7
+
+    def test_list_models_reports_forced_qwen4_ple_offload(self, tmp_path):
+        from omlx.patches.mlx_vlm_qwen4_exp_compat.residency import (
+            Qwen4ExpResidencyEstimate,
+        )
+
+        model_path = tmp_path / "qwen4"
+        model_path.mkdir()
+        estimate = Qwen4ExpResidencyEstimate(
+            supported=True,
+            checkpoint_bytes=950,
+            ple_bytes=550,
+            resident_bytes=1000,
+            mmap_bytes=400,
+        )
+        pool = MagicMock()
+        pool.get_status.return_value = {
+            "models": [
+                {
+                    "id": "qwen4",
+                    "model_path": str(model_path),
+                    "config_model_type": "qwen4_exp",
+                    "estimated_size": 1000,
+                }
+            ]
+        }
+        pool._fallback_admission_ceiling.return_value = 500
+        manager = MagicMock()
+        manager.get_all_settings.return_value = {}
+        state = MagicMock(default_model=None)
+
+        with (
+            patch.object(admin_routes, "_get_engine_pool", return_value=pool),
+            patch.object(admin_routes, "_get_settings_manager", return_value=manager),
+            patch.object(admin_routes, "_get_server_state", return_value=state),
+            patch.object(admin_routes, "_get_global_settings", return_value=None),
+            patch.object(admin_routes, "_dflash_compat_for_model", return_value=(False, "")),
+            patch.object(admin_routes, "_mtp_compat_for_model", return_value=(False, "")),
+            patch.object(admin_routes, "_paroquant_compat_for_model", return_value=(False, "")),
+            patch(
+                "omlx.patches.mlx_vlm_qwen4_exp_compat.residency."
+                "qwen4_exp_residency_estimate",
+                return_value=estimate,
+            ),
+        ):
+            result = asyncio.run(admin_routes.list_models(is_admin=True))
+
+        model = result["models"][0]
+        assert model["qwen4_ple_ssd_offload_supported"] is True
+        assert model["qwen4_ple_ssd_offload_forced"] is True
+        assert model["qwen4_ple_resident_bytes"] == 1000
+        assert model["qwen4_ple_mmap_bytes"] == 400
+
+    def test_list_models_reports_forced_deepseek_v41_engram_offload(self, tmp_path):
+        from omlx.patches.deepseek_v41.residency import (
+            EngramResidencyEstimate,
+        )
+
+        model_path = tmp_path / "v41"
+        model_path.mkdir()
+        estimate = EngramResidencyEstimate(
+            supported=True,
+            engram_bytes=550,
+            resident_bytes=1000,
+            mmap_bytes=400,
+        )
+        pool = MagicMock()
+        pool.get_status.return_value = {
+            "models": [
+                {
+                    "id": "v41",
+                    "model_path": str(model_path),
+                    "config_model_type": "deepseek_v41",
+                    "estimated_size": 1000,
+                }
+            ]
+        }
+        pool._fallback_admission_ceiling.return_value = 500
+        manager = MagicMock()
+        manager.get_all_settings.return_value = {}
+        state = MagicMock(default_model=None)
+
+        with (
+            patch.object(admin_routes, "_get_engine_pool", return_value=pool),
+            patch.object(admin_routes, "_get_settings_manager", return_value=manager),
+            patch.object(admin_routes, "_get_server_state", return_value=state),
+            patch.object(admin_routes, "_get_global_settings", return_value=None),
+            patch.object(
+                admin_routes, "_dflash_compat_for_model", return_value=(False, "")
+            ),
+            patch.object(
+                admin_routes, "_mtp_compat_for_model", return_value=(False, "")
+            ),
+            patch.object(
+                admin_routes, "_paroquant_compat_for_model", return_value=(False, "")
+            ),
+            patch(
+                "omlx.patches.deepseek_v41.residency."
+                "deepseek_v41_residency_estimate",
+                return_value=estimate,
+            ),
+        ):
+            result = asyncio.run(admin_routes.list_models(is_admin=True))
+
+        model = result["models"][0]
+        assert model["deepseek_v41_engram_ssd_offload_supported"] is True
+        assert model["deepseek_v41_engram_ssd_offload_forced"] is True
+        assert model["deepseek_v41_engram_resident_bytes"] == 1000
+        assert model["deepseek_v41_engram_mmap_bytes"] == 400
+
+    def test_list_models_adds_display_name_without_changing_id(self, tmp_path):
+        """Ensure nested model paths only affect UI display names."""
+        model_root = tmp_path / "models"
+        model_path = model_root / "deepsweet" / "Qwen3.6-27B-MLX-oQ5-FP16"
+        model_path.mkdir(parents=True)
+        model_id = "Qwen3.6-27B-MLX-oQ5-FP16"
+
+        mock_engine_pool = MagicMock()
+        mock_engine_pool.splash_target.return_value = (None, "")
+        mock_engine_pool.get_status.return_value = {
+            "models": [
+                {
+                    "id": model_id,
+                    "model_path": str(model_path),
+                    "loaded": False,
+                    "estimated_size": 1000,
+                    "pinned": False,
+                    "engine_type": "batched",
+                    "model_type": "llm",
+                }
+            ]
+        }
+
+        mock_settings_manager = MagicMock()
+        mock_settings_manager.get_all_settings.return_value = {}
+
+        mock_server_state = MagicMock()
+        mock_server_state.default_model = None
+
+        mock_global_settings = SimpleNamespace(
+            base_path=tmp_path,
+            model=SimpleNamespace(get_model_dirs=lambda base_path: [model_root]),
+            integrations=SimpleNamespace(splash_path=None),
+        )
+
+        with (
+            patch.object(
+                admin_routes, "_get_engine_pool", return_value=mock_engine_pool
+            ),
+            patch.object(
+                admin_routes,
+                "_get_settings_manager",
+                return_value=mock_settings_manager,
+            ),
+            patch.object(
+                admin_routes, "_get_server_state", return_value=mock_server_state
+            ),
+            patch.object(
+                admin_routes,
+                "_get_global_settings",
+                return_value=mock_global_settings,
+            ),
+            patch.object(
+                admin_routes,
+                "_paroquant_compat_for_model",
+                return_value=(False, None),
+            ),
+            patch.object(
+                admin_routes,
+                "_dflash_compat_for_model",
+                return_value=(False, None),
+            ),
+            patch.object(
+                admin_routes,
+                "_mtp_compat_for_model",
+                return_value=(False, None),
+            ),
+        ):
+            result = asyncio.run(admin_routes.list_models(is_admin=True))
+
+        model = result["models"][0]
+        assert model["id"] == model_id
+        assert model["display_name"] == f"deepsweet/{model_id}"
 
 
 class TestValidateApiKey:
@@ -152,6 +336,31 @@ class TestValidateApiKey:
         assert is_valid is False
         assert "printable" in msg
 
+    def test_non_ascii_accented(self):
+        # Printable but non-ASCII: passes isprintable(), caught by isascii().
+        # Such a key can never be matched over HTTP (headers are latin-1
+        # decoded), so it must be rejected at configuration time.
+        is_valid, msg = validate_api_key("café-key")
+        assert is_valid is False
+        assert "ASCII" in msg
+
+    def test_non_ascii_emoji(self):
+        is_valid, msg = validate_api_key("key-\U0001f511")
+        assert is_valid is False
+        assert "ASCII" in msg
+
+    def test_non_ascii_cyrillic(self):
+        is_valid, msg = validate_api_key("ключ-секрет")
+        assert is_valid is False
+        assert "ASCII" in msg
+
+    def test_ascii_key_still_valid(self):
+        # Regression guard: ordinary ASCII keys remain valid after the
+        # ASCII-only rule was added.
+        is_valid, msg = validate_api_key("sk-abc123XYZ")
+        assert is_valid is True
+        assert msg == ""
+
 
 class TestVerifyApiKeyAdmin:
     """Tests for verify_api_key() constant-time comparison."""
@@ -177,26 +386,31 @@ class TestVerifyAnyApiKey:
 
     def test_matches_main_key(self):
         from omlx.settings import SubKeyEntry
+
         sub_keys = [SubKeyEntry(key="sub1"), SubKeyEntry(key="sub2")]
         assert verify_any_api_key("main-key", "main-key", sub_keys) is True
 
     def test_matches_sub_key(self):
         from omlx.settings import SubKeyEntry
+
         sub_keys = [SubKeyEntry(key="sub1"), SubKeyEntry(key="sub2")]
         assert verify_any_api_key("sub2", "main-key", sub_keys) is True
 
     def test_no_match(self):
         from omlx.settings import SubKeyEntry
+
         sub_keys = [SubKeyEntry(key="sub1")]
         assert verify_any_api_key("wrong", "main-key", sub_keys) is False
 
     def test_empty_api_key(self):
         from omlx.settings import SubKeyEntry
+
         sub_keys = [SubKeyEntry(key="sub1")]
         assert verify_any_api_key("", "main-key", sub_keys) is False
 
     def test_no_main_key_matches_sub(self):
         from omlx.settings import SubKeyEntry
+
         sub_keys = [SubKeyEntry(key="sub1")]
         assert verify_any_api_key("sub1", "", sub_keys) is True
 
@@ -211,6 +425,7 @@ class TestVerifyAnyApiKey:
 
     def test_none_main_key_matches_sub(self):
         from omlx.settings import SubKeyEntry
+
         sub_keys = [SubKeyEntry(key="sub1")]
         assert verify_any_api_key("sub1", None, sub_keys) is True
 
@@ -237,7 +452,9 @@ class TestLoginRejectsSubKey:
         try:
             request = admin_routes.LoginRequest(api_key="sub-key-1")
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.login(request, MagicMock()))
+                asyncio.run(
+                    admin_routes.login(request, MagicMock(), _loopback_http_request())
+                )
             assert exc_info.value.status_code == 401
         finally:
             _restore_getter(original)
@@ -254,7 +471,9 @@ class TestLoginRejectsSubKey:
         original = _patch_getter(mock_settings)
         try:
             request = admin_routes.LoginRequest(api_key="main-key")
-            result = asyncio.run(admin_routes.login(request, mock_response))
+            result = asyncio.run(
+                admin_routes.login(request, mock_response, _loopback_http_request())
+            )
             assert result["success"] is True
         finally:
             _restore_getter(original)
@@ -359,6 +578,30 @@ class TestSubKeyCRUD:
         finally:
             _restore_getter(original)
 
+    def test_delete_sub_key_lone_surrogate_returns_404(self):
+        """Regression for #1717: a lone-surrogate key must 404, not 500.
+
+        delete_sub_key compares request.key without a validate_api_key
+        gate, so the comparison itself must tolerate any str json.loads
+        can produce, including lone surrogates from escape sequences.
+        """
+        import json
+
+        from fastapi import HTTPException
+        from omlx.settings import SubKeyEntry
+
+        mock_settings = _mock_global_settings(api_key="main-key")
+        mock_settings.auth.sub_keys = [SubKeyEntry(key="real-sub-key")]
+        original = _patch_getter(mock_settings)
+        try:
+            request = admin_routes.DeleteSubKeyRequest(key=json.loads('"\\ud800abcd"'))
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(admin_routes.delete_sub_key(request, is_admin=True))
+            assert exc_info.value.status_code == 404
+            assert len(mock_settings.auth.sub_keys) == 1
+        finally:
+            _restore_getter(original)
+
     def test_create_sub_key_rollback_on_save_failure(self):
         """Sub key should be rolled back if save() fails."""
         from fastapi import HTTPException
@@ -382,7 +625,14 @@ def _mock_global_settings(api_key=None):
     """Create a mock GlobalSettings with the given API key."""
     mock = MagicMock()
     mock.auth.api_key = api_key
+    mock.auth.skip_api_key_verification = False
+    mock.server.host = "127.0.0.1"
     return mock
+
+
+def _loopback_http_request():
+    """Create the request state accepted by the loopback-only setup endpoint."""
+    return SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"))
 
 
 def _patch_getter(mock_settings):
@@ -400,6 +650,26 @@ def _restore_getter(original):
 class TestSetupApiKeyEndpoint:
     """Tests for POST /admin/api/setup-api-key endpoint logic."""
 
+    def test_setup_returns_503_when_settings_are_unavailable(self):
+        from fastapi import HTTPException
+
+        original = _patch_getter(None)
+        try:
+            request = admin_routes.SetupApiKeyRequest(
+                api_key="validkey123", api_key_confirm="validkey123"
+            )
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.setup_api_key(
+                        request, MagicMock(), _loopback_http_request()
+                    )
+                )
+
+            assert exc_info.value.status_code == 503
+            assert "not initialized" in exc_info.value.detail
+        finally:
+            _restore_getter(original)
+
     def test_setup_rejects_when_key_already_set(self):
         """Setup should fail if API key is already configured."""
         from fastapi import HTTPException
@@ -411,7 +681,11 @@ class TestSetupApiKeyEndpoint:
                 api_key="newkey", api_key_confirm="newkey"
             )
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.setup_api_key(request, MagicMock()))
+                asyncio.run(
+                    admin_routes.setup_api_key(
+                        request, MagicMock(), _loopback_http_request()
+                    )
+                )
             assert exc_info.value.status_code == 400
             assert "already configured" in exc_info.value.detail
         finally:
@@ -428,7 +702,11 @@ class TestSetupApiKeyEndpoint:
                 api_key="key1", api_key_confirm="key2"
             )
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.setup_api_key(request, MagicMock()))
+                asyncio.run(
+                    admin_routes.setup_api_key(
+                        request, MagicMock(), _loopback_http_request()
+                    )
+                )
             assert exc_info.value.status_code == 400
             assert "do not match" in exc_info.value.detail
         finally:
@@ -445,7 +723,11 @@ class TestSetupApiKeyEndpoint:
                 api_key="abc", api_key_confirm="abc"
             )
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.setup_api_key(request, MagicMock()))
+                asyncio.run(
+                    admin_routes.setup_api_key(
+                        request, MagicMock(), _loopback_http_request()
+                    )
+                )
             assert exc_info.value.status_code == 400
             assert "at least 4" in exc_info.value.detail
         finally:
@@ -462,9 +744,59 @@ class TestSetupApiKeyEndpoint:
                 api_key="ab cd", api_key_confirm="ab cd"
             )
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.setup_api_key(request, MagicMock()))
+                asyncio.run(
+                    admin_routes.setup_api_key(
+                        request, MagicMock(), _loopback_http_request()
+                    )
+                )
             assert exc_info.value.status_code == 400
             assert "whitespace" in exc_info.value.detail
+        finally:
+            _restore_getter(original)
+
+    def test_setup_rejects_non_loopback_configured_bind(self):
+        """Initial setup is unavailable once the server is network-facing."""
+        from fastapi import HTTPException
+
+        mock_settings = _mock_global_settings(api_key=None)
+        mock_settings.server.host = "0.0.0.0"
+        original = _patch_getter(mock_settings)
+        try:
+            request = admin_routes.SetupApiKeyRequest(
+                api_key="validkey123", api_key_confirm="validkey123"
+            )
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.setup_api_key(
+                        request, MagicMock(), _loopback_http_request()
+                    )
+                )
+
+            assert exc_info.value.status_code == 403
+            assert "only available over loopback" in exc_info.value.detail
+            mock_settings.save.assert_not_called()
+        finally:
+            _restore_getter(original)
+
+    def test_setup_rejects_non_loopback_client(self):
+        """A remote peer cannot claim the first key on a loopback setup."""
+        from fastapi import HTTPException
+
+        mock_settings = _mock_global_settings(api_key=None)
+        remote_request = SimpleNamespace(client=SimpleNamespace(host="192.168.1.50"))
+        original = _patch_getter(mock_settings)
+        try:
+            request = admin_routes.SetupApiKeyRequest(
+                api_key="validkey123", api_key_confirm="validkey123"
+            )
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.setup_api_key(request, MagicMock(), remote_request)
+                )
+
+            assert exc_info.value.status_code == 403
+            assert "only available over loopback" in exc_info.value.detail
+            mock_settings.save.assert_not_called()
         finally:
             _restore_getter(original)
 
@@ -484,7 +816,9 @@ class TestSetupApiKeyEndpoint:
                     api_key="validkey123", api_key_confirm="validkey123"
                 )
                 result = asyncio.run(
-                    admin_routes.setup_api_key(request, mock_response)
+                    admin_routes.setup_api_key(
+                        request, mock_response, _loopback_http_request()
+                    )
                 )
 
                 assert result["success"] is True
@@ -508,7 +842,9 @@ class TestLoginEndpoint:
         try:
             request = admin_routes.LoginRequest(api_key="anykey")
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.login(request, MagicMock()))
+                asyncio.run(
+                    admin_routes.login(request, MagicMock(), _loopback_http_request())
+                )
             assert exc_info.value.status_code == 400
             assert "No API key configured" in exc_info.value.detail
         finally:
@@ -523,7 +859,9 @@ class TestLoginEndpoint:
         try:
             request = admin_routes.LoginRequest(api_key="wrong-key")
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.login(request, MagicMock()))
+                asyncio.run(
+                    admin_routes.login(request, MagicMock(), _loopback_http_request())
+                )
             assert exc_info.value.status_code == 401
         finally:
             _restore_getter(original)
@@ -535,7 +873,9 @@ class TestLoginEndpoint:
         original = _patch_getter(mock_settings)
         try:
             request = admin_routes.LoginRequest(api_key="correct-key")
-            result = asyncio.run(admin_routes.login(request, mock_response))
+            result = asyncio.run(
+                admin_routes.login(request, mock_response, _loopback_http_request())
+            )
             assert result["success"] is True
             mock_response.set_cookie.assert_called_once()
         finally:
@@ -545,14 +885,12 @@ class TestLoginEndpoint:
 class TestStatsSecurity:
     """Tests for /admin/api/stats response hardening."""
 
-    def test_stats_response_does_not_include_raw_api_key(self):
-        """The stats payload must not leak auth.api_key."""
+    def test_stats_response_includes_api_key_for_admin(self):
+        """The stats payload includes api_key for admin CLI snippet generation."""
         mock_settings = MagicMock()
         mock_settings.server.host = "127.0.0.1"
         mock_settings.server.port = 9981
         mock_settings.auth.api_key = "super-secret-key"
-        mock_settings.claude_code.context_scaling_enabled = True
-        mock_settings.claude_code.target_context_size = 200000
 
         mock_metrics = MagicMock()
         mock_metrics.get_snapshot.return_value = {
@@ -573,11 +911,295 @@ class TestStatsSecurity:
         ):
             result = asyncio.run(admin_routes.get_server_stats(is_admin=True))
 
-        assert "api_key" not in result
+        # api_key is included for admin-only CLI snippet generation in the dashboard
+        assert result["api_key"] == "super-secret-key"
+
+    def test_activity_response_does_not_build_runtime_cache_observability(self):
+        active_models = {"models": [{"id": "model-a"}]}
+
+        with (
+            patch.object(
+                admin_routes,
+                "_build_active_models_data",
+                return_value=active_models,
+            ),
+            patch.object(admin_routes, "_build_runtime_cache_observability") as build_runtime_cache,
+        ):
+            result = asyncio.run(admin_routes.get_server_activity(is_admin=True))
+
+        assert result == {"active_models": active_models}
+        build_runtime_cache.assert_not_called()
+
+    def test_active_models_data_ignores_enforcer_status_error(self):
+        """Admin stats should not fail when memory telemetry is unavailable."""
+        pool = MagicMock()
+        pool.get_status.return_value = {
+            "models": [],
+            "current_model_memory": 123,
+            "final_ceiling": 456,
+        }
+        enforcer = MagicMock(spec=["get_status"])
+        enforcer.get_status.side_effect = RuntimeError("host_statistics64 failed")
+        state = SimpleNamespace(process_memory_enforcer=enforcer)
+
+        with (
+            patch.object(admin_routes, "_get_engine_pool", return_value=pool),
+            patch.object(admin_routes, "_get_server_state", return_value=state),
+        ):
+            result = admin_routes._build_active_models_data()
+
+        assert result["model_memory_used"] == 123
+        assert result["model_memory_max"] == 456
+        assert result["memory_pressure"]["enabled"] is False
+
+    def test_stats_resolves_alias_on_read(self):
+        """Per-model dropdown ID may be an alias; stats endpoint should resolve
+        before querying the metrics store so per-model counters aren't zeroed."""
+        mock_settings = MagicMock()
+        mock_settings.server.host = "127.0.0.1"
+        mock_settings.server.port = 8000
+        mock_settings.auth.api_key = ""
+
+        mock_metrics = MagicMock()
+        mock_metrics.get_snapshot.return_value = {
+            "total_prompt_tokens": 100,
+            "total_cached_tokens": 0,
+            "cache_efficiency": 0,
+            "avg_prefill_tps": 0,
+            "avg_generation_tps": 0,
+            "total_requests": 1,
+        }
+
+        with (
+            patch.object(admin_routes, "_get_global_settings", return_value=mock_settings),
+            patch("omlx.server_metrics.get_server_metrics", return_value=mock_metrics),
+            patch("omlx.server.resolve_model_id", return_value="real-id"),
+            patch.object(admin_routes, "_get_engine_info", return_value={}),
+            patch.object(admin_routes, "_build_active_models_data", return_value={"models": []}),
+            patch.object(admin_routes, "_build_runtime_cache_observability", return_value={"models": []}),
+        ):
+            asyncio.run(admin_routes.get_server_stats(model="my-alias", is_admin=True))
+
+        # Snapshot query must use the resolved real ID, not the raw alias sent by the client.
+        call_args = mock_metrics.get_snapshot.call_args
+        assert call_args.kwargs["model_id"] == "real-id"
+
+    def test_stats_empty_model_stays_empty(self):
+        """Global aggregate query (empty model) must not be resolved or mangled."""
+        mock_settings = MagicMock()
+        mock_settings.server.host = "127.0.0.1"
+        mock_settings.server.port = 8000
+        mock_settings.auth.api_key = ""
+
+        mock_metrics = MagicMock()
+        mock_metrics.get_snapshot.return_value = {
+            "total_prompt_tokens": 0,
+            "total_cached_tokens": 0,
+            "cache_efficiency": 0,
+            "avg_prefill_tps": 0,
+            "avg_generation_tps": 0,
+            "total_requests": 0,
+        }
+
+        with (
+            patch.object(admin_routes, "_get_global_settings", return_value=mock_settings),
+            patch("omlx.server_metrics.get_server_metrics", return_value=mock_metrics),
+            patch("omlx.server.resolve_model_id") as mock_resolve,
+            patch.object(admin_routes, "_get_engine_info", return_value={}),
+            patch.object(admin_routes, "_build_active_models_data", return_value={"models": []}),
+            patch.object(admin_routes, "_build_runtime_cache_observability", return_value={"models": []}),
+        ):
+            asyncio.run(admin_routes.get_server_stats(is_admin=True))
+
+        # No resolve call for the empty-model (global aggregate) path.
+        mock_resolve.assert_not_called()
+        call_args = mock_metrics.get_snapshot.call_args
+        assert call_args.kwargs["model_id"] == ""
 
 
 class TestRuntimeCacheObservability:
     """Tests for runtime cache observability robustness."""
+
+    def test_runtime_cache_uses_model_scoped_ssd_stats(self):
+        """Rows stay model-scoped; the header counts each shared file once."""
+        cache_dir = Path("/tmp/omlx-cache")
+        unloaded_block = {cache_dir / "f" / "unloaded.safetensors": 100_000}
+
+        mock_settings = MagicMock()
+        mock_settings.base_path = Path("/tmp/omlx-base")
+        mock_settings.cache.get_ssd_cache_dir.return_value = cache_dir
+        mock_settings.cache.ssd_cache_max_size = "auto"
+        mock_settings.cache.get_ssd_cache_max_size_bytes.return_value = 0
+
+        shared_ssd_stats = {
+            "num_files": 999,
+            "total_size_bytes": 999_999_999,
+            "hot_cache_max_bytes": 0,
+            "hot_cache_size_bytes": 0,
+            "hot_cache_entries": 0,
+        }
+
+        manager_a = MagicMock()
+        manager_a.get_stats_for_model.return_value = {
+            "num_files": 3,
+            "total_size_bytes": 4096,
+            "hot_cache_max_bytes": 0,
+            "hot_cache_size_bytes": 0,
+            "hot_cache_entries": 0,
+        }
+        manager_a.get_tracked_files.return_value = {
+            cache_dir / "a" / "a.safetensors": 4096,
+            **unloaded_block,
+        }
+        scheduler_a = MagicMock()
+        scheduler_a.config.model_name = "/models/model-a"
+        scheduler_a.paged_ssd_cache_manager = manager_a
+        scheduler_a.get_ssd_cache_stats.return_value = {
+            "block_size": 1024,
+            "indexed_blocks": 12,
+            "ssd_cache": shared_ssd_stats,
+        }
+
+        manager_b = MagicMock()
+        manager_b.get_stats_for_model.return_value = {
+            "num_files": 7,
+            "total_size_bytes": 8192,
+            "hot_cache_max_bytes": 0,
+            "hot_cache_size_bytes": 0,
+            "hot_cache_entries": 0,
+        }
+        manager_b.get_tracked_files.return_value = {
+            cache_dir / "b" / "b.safetensors": 8192,
+            **unloaded_block,
+        }
+        scheduler_b = MagicMock()
+        scheduler_b.config.model_name = "/models/model-b"
+        scheduler_b.paged_ssd_cache_manager = manager_b
+        scheduler_b.get_ssd_cache_stats.return_value = {
+            "block_size": 2048,
+            "indexed_blocks": 4,
+            "ssd_cache": shared_ssd_stats,
+        }
+
+        entry_a = SimpleNamespace(
+            engine=SimpleNamespace(
+                _engine=SimpleNamespace(
+                    engine=SimpleNamespace(scheduler=scheduler_a)
+                )
+            )
+        )
+        entry_b = SimpleNamespace(
+            engine=SimpleNamespace(
+                _engine=SimpleNamespace(
+                    engine=SimpleNamespace(scheduler=scheduler_b)
+                )
+            )
+        )
+
+        engine_pool = MagicMock()
+        engine_pool.get_status.return_value = {
+            "models": [
+                {"id": "model-a", "loaded": True},
+                {"id": "model-b", "loaded": True},
+            ]
+        }
+        engine_pool._entries = {
+            "model-a": entry_a,
+            "model-b": entry_b,
+        }
+
+        with patch.object(admin_routes, "_get_engine_pool", return_value=engine_pool):
+            payload = admin_routes._build_runtime_cache_observability(mock_settings)
+
+        mock_settings.cache.get_ssd_cache_max_size_bytes.assert_not_called()
+        assert payload["total_num_files"] == 3
+        assert payload["total_size_bytes"] == 4096 + 8192 + 100_000
+        assert payload["effective_block_sizes"] == [1024, 2048]
+        rows = {row["id"]: row for row in payload["models"]}
+        assert rows["model-a"]["block_size"] == 1024
+        assert rows["model-a"]["indexed_blocks"] == 12
+        assert rows["model-a"]["num_files"] == 3
+        assert rows["model-a"]["total_size_bytes"] == 4096
+        assert rows["model-b"]["block_size"] == 2048
+        assert rows["model-b"]["indexed_blocks"] == 4
+        assert rows["model-b"]["num_files"] == 7
+        assert rows["model-b"]["total_size_bytes"] == 8192
+        for row in rows.values():
+            assert row["gdn_checkpoint_loads"] == 0
+            assert row["gdn_checkpoint_walkbacks"] == 0
+            assert row["gdn_last_restore"] is None
+            assert row["gdn_staging"]["sidecar_count"] == 0
+        manager_a.get_stats_for_model.assert_called_once_with("/models/model-a")
+        manager_b.get_stats_for_model.assert_called_once_with("/models/model-b")
+
+    def test_runtime_cache_uses_global_hot_cache_cap_not_sum(self):
+        """Aggregate hot cache max is a shared cap, not per-loaded-model sum."""
+        cache_dir = Path("/tmp/omlx-cache")
+        hot_cap = 10 * 1024**3
+
+        mock_settings = MagicMock()
+        mock_settings.base_path = Path("/tmp/omlx-base")
+        mock_settings.cache.get_ssd_cache_dir.return_value = cache_dir
+        mock_settings.cache.get_ssd_cache_max_size_bytes.return_value = 0
+
+        def _scheduler(model_name: str, hot_size: int, entries: int):
+            manager = MagicMock()
+            manager.get_stats_for_model.return_value = {
+                "num_files": entries,
+                "total_size_bytes": 4096 * entries,
+                "max_size_bytes": 0,
+                "hot_cache_max_bytes": hot_cap,
+                "hot_cache_size_bytes": hot_size,
+                "hot_cache_entries": entries,
+            }
+            scheduler = MagicMock()
+            scheduler.config.model_name = model_name
+            scheduler.paged_ssd_cache_manager = manager
+            scheduler.get_ssd_cache_stats.return_value = {
+                "block_size": 1024,
+                "indexed_blocks": entries,
+                "ssd_cache": {
+                    "num_files": 999,
+                    "total_size_bytes": 999_999,
+                    "hot_cache_max_bytes": hot_cap,
+                    "hot_cache_size_bytes": hot_size,
+                    "hot_cache_entries": entries,
+                },
+            }
+            return scheduler
+
+        scheduler_a = _scheduler("/models/model-a", hot_size=3 * 1024**3, entries=3)
+        scheduler_b = _scheduler("/models/model-b", hot_size=4 * 1024**3, entries=4)
+        engine_pool = MagicMock()
+        engine_pool.get_status.return_value = {
+            "models": [
+                {"id": "model-a", "loaded": True},
+                {"id": "model-b", "loaded": True},
+            ]
+        }
+        engine_pool._entries = {
+            "model-a": SimpleNamespace(
+                engine=SimpleNamespace(
+                    _engine=SimpleNamespace(
+                        engine=SimpleNamespace(scheduler=scheduler_a)
+                    )
+                )
+            ),
+            "model-b": SimpleNamespace(
+                engine=SimpleNamespace(
+                    _engine=SimpleNamespace(
+                        engine=SimpleNamespace(scheduler=scheduler_b)
+                    )
+                )
+            ),
+        }
+
+        with patch.object(admin_routes, "_get_engine_pool", return_value=engine_pool):
+            payload = admin_routes._build_runtime_cache_observability(mock_settings)
+
+        assert payload["hot_cache_size_bytes"] == 7 * 1024**3
+        assert payload["hot_cache_entries"] == 7
+        assert payload["hot_cache_max_bytes"] == hot_cap
 
     def test_runtime_cache_ignores_single_model_stats_failure(self):
         """One model failing stats collection should not break the whole payload."""
@@ -586,10 +1208,12 @@ class TestRuntimeCacheObservability:
         mock_settings = MagicMock()
         mock_settings.base_path = Path("/tmp/omlx-base")
         mock_settings.cache.get_ssd_cache_dir.return_value = cache_dir
+        mock_settings.cache.get_ssd_cache_max_size_bytes.return_value = 0
 
         bad_scheduler = MagicMock()
         bad_scheduler.get_ssd_cache_stats.side_effect = RuntimeError("boom")
         good_scheduler = MagicMock()
+        good_scheduler.paged_ssd_cache_manager = None
         good_scheduler.get_ssd_cache_stats.return_value = {
             "block_size": 1024,
             "indexed_blocks": 12,
@@ -644,6 +1268,7 @@ class TestRuntimeCacheObservability:
         mock_settings = MagicMock()
         mock_settings.base_path = Path("/tmp/omlx-base")
         mock_settings.cache.get_ssd_cache_dir.return_value = cache_dir
+        mock_settings.cache.get_ssd_cache_max_size_bytes.return_value = 0
 
         scheduler = MagicMock()
         scheduler.get_ssd_cache_stats.return_value = {
@@ -701,3 +1326,119 @@ class TestGlobalSettingsValidation:
             integrations_openclaw_tools_profile="coding"
         )
         assert req.integrations_openclaw_tools_profile == "coding"
+
+    def test_idle_timeout_rejects_negative(self):
+        with pytest.raises(ValidationError):
+            admin_routes.GlobalSettingsRequest(idle_timeout_seconds=-1)
+
+    def test_idle_timeout_rejects_below_minimum(self):
+        # Minimum is 60s — anything smaller (except 0) is not meaningful.
+        with pytest.raises(ValidationError):
+            admin_routes.GlobalSettingsRequest(idle_timeout_seconds=30)
+
+    def test_idle_timeout_accepts_null_explicitly(self):
+        req = admin_routes.GlobalSettingsRequest(idle_timeout_seconds=None)
+        assert req.idle_timeout_seconds is None
+        # model_fields_set should include it when explicitly passed.
+        assert "idle_timeout_seconds" in req.model_fields_set
+
+    def test_idle_timeout_accepts_zero_as_disabled(self):
+        # 0 means "no limit" (disabled) — normalizes to None.
+        req = admin_routes.GlobalSettingsRequest(idle_timeout_seconds=0)
+        assert req.idle_timeout_seconds is None
+        assert "idle_timeout_seconds" in req.model_fields_set
+
+    def test_idle_timeout_accepts_empty_string_as_disabled(self):
+        # Empty string from cleared textbox normalizes to None.
+        req = admin_routes.GlobalSettingsRequest(idle_timeout_seconds="")
+        assert req.idle_timeout_seconds is None
+        assert "idle_timeout_seconds" in req.model_fields_set
+
+    def test_idle_timeout_accepts_valid_value(self):
+        req = admin_routes.GlobalSettingsRequest(idle_timeout_seconds=1800)
+        assert req.idle_timeout_seconds == 1800
+
+    @pytest.mark.parametrize("value", ["60", 60.0])
+    def test_idle_timeout_preserves_integer_coercion(self, value):
+        req = admin_routes.GlobalSettingsRequest(idle_timeout_seconds=value)
+        assert req.idle_timeout_seconds == 60
+
+    @pytest.mark.parametrize("value", [False, True])
+    def test_idle_timeout_rejects_boolean(self, value):
+        with pytest.raises(ValidationError):
+            admin_routes.GlobalSettingsRequest(idle_timeout_seconds=value)
+
+    def test_context_window_policy_rejects_negative(self):
+        with pytest.raises(ValidationError):
+            admin_routes.GlobalSettingsRequest(sampling_max_context_window_policy=-1)
+
+    def test_context_window_policy_accepts_null(self):
+        req = admin_routes.GlobalSettingsRequest(
+            sampling_max_context_window_policy=None
+        )
+        assert req.sampling_max_context_window_policy is None
+        assert "sampling_max_context_window_policy" in req.model_fields_set
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_kv", [False, True])
+async def test_offline_ssd_sidecar_usage_and_clear(tmp_path, monkeypatch, include_kv):
+    cache_dir = tmp_path / "cache"
+    sidecar = cache_dir / "_gdn_sidecars" / ("a" * 64) / "abcd.safetensors"
+    sidecar.parent.mkdir(parents=True)
+    sidecar.write_bytes(b"sidecar")
+    if include_kv:
+        block = cache_dir / "b" / "abcd.safetensors"
+        block.parent.mkdir()
+        block.write_bytes(b"kv")
+    settings = SimpleNamespace(
+        base_path=tmp_path,
+        cache=SimpleNamespace(
+            ssd_cache_max_size="1GB",
+            get_ssd_cache_dir=lambda _: cache_dir,
+            is_ssd_cache_dir_unavailable=lambda: False,
+            get_ssd_cache_max_size_bytes=lambda _: 10**9,
+        ),
+    )
+    monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: settings)
+    monkeypatch.setattr(
+        admin_routes,
+        "_get_engine_pool",
+        lambda: SimpleNamespace(get_status=lambda: {"models": []}, _entries={}),
+    )
+    monkeypatch.setattr(
+        admin_routes, "_clear_cold_remote_cluster_cache_roots", lambda _: (0, 0)
+    )
+    before = admin_routes._build_runtime_cache_observability(settings)
+    assert before["total_num_files"] == 1 + include_kv
+    assert before["total_size_bytes"] == 7 + 2 * include_kv
+    result = await admin_routes.clear_ssd_cache(is_admin=True)
+    assert result["total_deleted"] == 1 + include_kv
+    assert not list(cache_dir.rglob("*.safetensors"))
+    after = admin_routes._build_runtime_cache_observability(settings)
+    assert after["total_num_files"] == 0
+    assert after["total_size_bytes"] == 0
+
+
+@pytest.mark.parametrize("link_level", ["root", "signature", "file"])
+def test_offline_gdn_scan_preserves_symlink_targets(tmp_path, link_level):
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "state.safetensors"
+    target.write_bytes(b"keep")
+    root = cache_dir / "_gdn_sidecars"
+    if link_level == "root":
+        root.symlink_to(outside, target_is_directory=True)
+    else:
+        root.mkdir()
+        signature = root / ("a" * 64)
+        if link_level == "signature":
+            signature.symlink_to(outside, target_is_directory=True)
+        else:
+            signature.mkdir()
+            (signature / "state.safetensors").symlink_to(target)
+    assert admin_routes._scan_offline_gdn_sidecars(cache_dir) == (0, 0)
+    assert admin_routes._scan_offline_gdn_sidecars(cache_dir, clear=True) == (0, 0)
+    assert target.read_bytes() == b"keep"
