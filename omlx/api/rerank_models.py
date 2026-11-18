@@ -21,20 +21,39 @@ class RerankRequest(BaseModel):
     model: str
     """ID of the model to use."""
 
-    query: str
-    """The search query to compare documents against."""
+    query: str | dict[str, str]
+    """
+    The search query to compare documents against. String for text-only
+    rerankers. Dict with 'text' and/or 'image' (base64 data URI) for
+    multimodal rerankers like Qwen3-VL-Reranker.
+    """
 
     documents: list[str] | list[dict[str, str]]
     """
     Documents to rerank. Can be:
     - List of strings
-    - List of dicts with 'text' field
+    - List of dicts with 'text' field (and optional 'image' for multimodal
+      rerankers). Image values must be base64 data URIs.
     """
 
-    top_n: int | None = None
+    instruction: str | None = None
+    """
+    Task instruction for Qwen3-Reranker and Qwen3-VL-Reranker, rendered into
+    the `<Instruct>:` slot. If not specified or empty, the default instruction
+    is used. Other rerankers ignore it.
+    """
+
+    top_n: int | None = Field(default=None, gt=0)
     """
     Number of top results to return.
-    If not specified, returns all documents.
+    If not specified, returns all documents. Must be positive: 0 would
+    return an empty result and negative values silently drop results.
+    """
+
+    max_length: int | None = Field(default=None, gt=0)
+    """
+    Maximum token length for each query-document pair. If not specified, the
+    model's own limit is used. Encoder rerankers cap it at the tokenizer limit.
     """
 
     return_documents: bool = True
@@ -58,8 +77,9 @@ class RerankResult(BaseModel):
 
     document: dict[str, str] | None = None
     """
-    The document text (if return_documents=True).
-    Format: {"text": "..."}
+    The document (if return_documents=True). For text-only rerankers or
+    string inputs, format is {"text": "..."}. For multimodal inputs, the
+    original dict (including 'image') is returned as-is.
     """
 
 

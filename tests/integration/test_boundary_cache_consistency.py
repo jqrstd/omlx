@@ -36,8 +36,8 @@ pytestmark = [
 
 MODELS = {
     "kvcache": {
-        "path": "/Users/cryingneko/Workspace/models/MiniMax-M2.5-3bit",
-        "desc": "KVCache only (MiniMax-M2.5)",
+        "path": "/Users/cryingneko/Workspace/models/Qwen3-4B-Instruct-2507-4bit",
+        "desc": "KVCache only (Qwen3-4B)",
         "expect_on_off_match": True,
     },
     "arrayscache_dense": {
@@ -46,7 +46,7 @@ MODELS = {
         "expect_on_off_match": True,
     },
     "arrayscache_moe": {
-        "path": "/Users/cryingneko/Workspace/models/Qwen3.5-35B-A3B-8bit",
+        "path": "/Users/cryingneko/Workspace/models/Qwen3.5-35B-A3B-oQ4",
         "desc": "ArraysCache hybrid MoE (Qwen3.5-35B-A3B)",
         "expect_on_off_match": True,
     },
@@ -54,6 +54,11 @@ MODELS = {
         "path": "/Volumes/SSD/Models/gpt-oss-120b-MXFP4-Q8",
         "desc": "RotatingKVCache+KVCache hybrid (gpt-oss-120b)",
         "expect_on_off_match": False,  # chunk size differs, quality-only check
+    },
+    "rotating_vlm": {
+        "path": "/Users/cryingneko/Workspace/models/gemma-3-12b-it-qat-4bit",
+        "desc": "RotatingKVCache+KVCache VLM hybrid (Gemma3-12B-QAT)",
+        "expect_on_off_match": False,  # chunk size differs for RotatingKVCache
     },
 }
 
@@ -194,18 +199,12 @@ def _run_model_test(model_path: str, model_desc: str, expect_on_off_match: bool)
     import mlx.core as mx
     from mlx_lm import load
 
-    from omlx.patches.gated_delta_advance import (
-        apply_gated_delta_advance_patch,
-    )
-
     print(f"\n{'='*60}")
     print(f"Testing: {model_desc}")
     print(f"Path: {model_path}")
     print(f"{'='*60}")
 
     model, tokenizer = load(model_path)
-    patch_applied = apply_gated_delta_advance_patch(model)
-    print(f"  GatedDeltaNet advance patch: {'applied' if patch_applied else 'skipped (not needed)'}")
 
     prompt_token_ids = _build_8k_prompt(tokenizer)
     print(f"  Prompt tokens: {len(prompt_token_ids)}")

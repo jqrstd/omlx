@@ -8,9 +8,9 @@ These models define the request and response schemas for:
 - Tool calling in Anthropic format
 """
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, get_args
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag, model_validator
 
 from omlx.api.shared_models import IDPrefix, generate_id
 
@@ -24,6 +24,7 @@ class ContentBlockText(BaseModel):
 
     type: Literal["text"] = "text"
     text: str
+    cache_control: dict[str, str] | None = None
 
 
 class ContentBlockImage(BaseModel):
@@ -49,6 +50,7 @@ class ContentBlockToolResult(BaseModel):
     tool_use_id: str
     content: str | list[dict[str, Any]] | dict[str, Any] | list[Any] | Any
     is_error: bool | None = None
+    cache_control: dict[str, str] | None = None
 
 
 class ContentBlockThinking(BaseModel):
@@ -59,14 +61,76 @@ class ContentBlockThinking(BaseModel):
     signature: str | None = None
 
 
-# Union type for all content blocks
-ContentBlock = (
+class ContentBlockDocument(BaseModel):
+    """Document content block (PDF, plain text)."""
+
+    type: Literal["document"] = "document"
+    source: dict[str, Any]  # {"type": "base64", "media_type": "application/pdf", "data": "..."}
+    title: str | None = None
+    context: str | None = None
+    citations: dict[str, Any] | None = None
+    cache_control: dict[str, str] | None = None
+
+
+class ContentBlockInputAudio(BaseModel):
+    """Audio input content block for multimodal audio models.
+
+    Uses the same shape as OpenAI's input_audio content part so that
+    the internal VLM engine receives a uniform representation regardless
+    of which API endpoint the client used.
+    """
+
+    type: Literal["input_audio"] = "input_audio"
+    input_audio: dict[str, Any]  # {"data": "<base64>", "format": "wav"}
+
+
+class ContentBlockUnknown(BaseModel):
+    """Content block type this server does not model. Converters skip it."""
+
+    type: str
+    model_config = ConfigDict(extra="allow")
+
+
+# A block without `type` keeps the smart-union inference over the typed models.
+_UntypedContentBlock = (
     ContentBlockText
     | ContentBlockImage
     | ContentBlockToolUse
     | ContentBlockToolResult
     | ContentBlockThinking
+    | ContentBlockDocument
+    | ContentBlockInputAudio
 )
+_KNOWN_CONTENT_BLOCK_TYPES = frozenset(
+    cls.model_fields["type"].default for cls in get_args(_UntypedContentBlock)
+)
+
+
+def _content_block_tag(value: Any) -> str:
+    if isinstance(value, dict):
+        block_type = value.get("type")
+    else:
+        block_type = getattr(value, "type", None)
+    if not isinstance(block_type, str) or not block_type:
+        return "untyped"
+    if block_type in _KNOWN_CONTENT_BLOCK_TYPES:
+        return block_type
+    return "unknown"
+
+
+# Known types validate strictly. Unknown types are accepted and then ignored.
+ContentBlock = Annotated[
+    Annotated[_UntypedContentBlock, Tag("untyped")]
+    | Annotated[ContentBlockText, Tag("text")]
+    | Annotated[ContentBlockImage, Tag("image")]
+    | Annotated[ContentBlockToolUse, Tag("tool_use")]
+    | Annotated[ContentBlockToolResult, Tag("tool_result")]
+    | Annotated[ContentBlockThinking, Tag("thinking")]
+    | Annotated[ContentBlockDocument, Tag("document")]
+    | Annotated[ContentBlockInputAudio, Tag("input_audio")]
+    | Annotated[ContentBlockUnknown, Tag("unknown")],
+    Discriminator(_content_block_tag),
+]
 
 
 # =============================================================================
@@ -90,7 +154,7 @@ class SystemContent(BaseModel):
 class AnthropicMessage(BaseModel):
     """A message in an Anthropic conversation."""
 
-    role: Literal["user", "assistant"]
+    role: Literal["user", "assistant", "system"]
     content: str | list[ContentBlock]
 
 
@@ -100,18 +164,41 @@ class AnthropicMessage(BaseModel):
 
 
 class AnthropicTool(BaseModel):
-    """Tool definition in Anthropic format."""
+    """Tool definition in Anthropic format.
+
+    Supports two shapes:
+      1. User-defined tool: requires ``input_schema``.
+      2. Anthropic server-side tool (web_search, code_execution, bash,
+         text_editor, computer): carries a versioned ``type`` like
+         ``web_search_20250305`` and no ``input_schema``. oMLX cannot execute
+         these locally; they are accepted for compatibility with clients such
+         as Claude for Excel/PowerPoint/Word and dropped before inference.
+    """
 
     name: str
     description: str | None = None
-    input_schema: dict[str, Any]
+    input_schema: dict[str, Any] | None = None
+    type: str | None = None
     cache_control: dict[str, str] | None = None
+
+    # Forward-compat with extra fields Anthropic may attach to server-side
+    # tools (e.g. max_uses, allowed_domains, user_location for web_search).
+    model_config = ConfigDict(extra="allow")
+
+    @model_validator(mode="after")
+    def _require_schema_or_type(self) -> "AnthropicTool":
+        if self.input_schema is None and self.type is None:
+            raise ValueError(
+                "AnthropicTool requires either 'input_schema' (user-defined "
+                "tool) or 'type' (Anthropic server-side tool)."
+            )
+        return self
 
 
 class ToolChoice(BaseModel):
     """Tool choice specification."""
 
-    type: Literal["auto", "any", "tool"]
+    type: Literal["auto", "any", "tool", "none"]
     name: str | None = None  # Required when type="tool"
 
 
@@ -136,12 +223,12 @@ class MessagesRequest(BaseModel):
     """Request for Anthropic Messages API."""
 
     model: str
-    max_tokens: int
+    max_tokens: int = Field(gt=0)
     messages: list[AnthropicMessage]
     system: str | list[SystemContent] | None = None
     stop_sequences: list[str] | None = None
     stream: bool = False
-    temperature: float | None = 1.0
+    temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
     metadata: dict[str, Any] | None = None

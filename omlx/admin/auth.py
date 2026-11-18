@@ -5,13 +5,26 @@ This module provides session-based authentication using signed tokens
 and API key verification for admin panel access.
 """
 
+import hashlib
+import ipaddress
+import logging
+import math
 import os
 import secrets
+import threading
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Optional
 
 from fastapi import HTTPException, Request
 from fastapi.responses import RedirectResponse
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+from starlette.requests import HTTPConnection
+
+from ..utils.network import is_loopback_bind_host
+
+logger = logging.getLogger(__name__)
 
 # Session configuration
 SESSION_COOKIE_NAME = "omlx_admin_session"
@@ -27,8 +40,14 @@ SECRET_KEY = os.environ.get("OMLX_SECRET_KEY") or secrets.token_hex(32)
 # Initialize the serializer for creating and verifying session tokens
 _serializer = URLSafeTimedSerializer(SECRET_KEY)
 
+# Global settings getter (set by init_auth)
+_get_global_settings = None
 
-def init_auth(secret_key: str) -> None:
+# Browser requests are redirected to the login page only while it is served.
+_web_ui_enabled = True
+
+
+def init_auth(secret_key: str, global_settings_getter=None) -> None:
     """Initialize authentication with a persistent secret key.
 
     Should be called during server startup with the secret key from settings.
@@ -36,12 +55,26 @@ def init_auth(secret_key: str) -> None:
 
     Args:
         secret_key: The secret key from settings.json for signing tokens.
+        global_settings_getter: Optional callable that returns GlobalSettings.
     """
-    global _serializer, SECRET_KEY
+    global _serializer, SECRET_KEY, _get_global_settings
     # Environment variable takes priority over settings
     key = os.environ.get("OMLX_SECRET_KEY") or secret_key
     SECRET_KEY = key
     _serializer = URLSafeTimedSerializer(key)
+    if global_settings_getter is not None:
+        _get_global_settings = global_settings_getter
+
+
+def set_web_ui_enabled(enabled: bool) -> None:
+    """Record whether the server serves the browser admin pages."""
+    global _web_ui_enabled
+    _web_ui_enabled = enabled
+
+
+def web_ui_enabled() -> bool:
+    """Return whether the server serves the browser admin pages."""
+    return _web_ui_enabled
 
 
 def create_session_token(remember: bool = False) -> str:
@@ -103,10 +136,54 @@ def verify_session_token(token: str, max_age: int = SESSION_MAX_AGE) -> bool:
         return False
 
 
+def compare_keys(provided_key: str, expected_key: str) -> bool:
+    """Compare two API keys in constant time, tolerating any str input.
+
+    secrets.compare_digest raises TypeError when given str arguments that
+    contain non-ASCII characters, which turns a bad client key into an
+    unhandled 500 instead of a 401. Comparing UTF-8 bytes accepts any
+    input while keeping the constant-time guarantee. surrogatepass covers
+    lone surrogates, which json.loads can produce from escape sequences
+    and which strict UTF-8 encoding rejects.
+
+    Both arguments must be str; None is the caller's responsibility.
+
+    Args:
+        provided_key: The key supplied by the client (untrusted).
+        expected_key: The configured key to compare against.
+
+    Returns:
+        True if the keys match, False otherwise.
+    """
+    return secrets.compare_digest(
+        provided_key.encode("utf-8", "surrogatepass"),
+        expected_key.encode("utf-8", "surrogatepass"),
+    )
+
+
+def fingerprint_key(api_key: str) -> str:
+    """Return a short, non-reversible fingerprint of an API key for logging.
+
+    Logging a rejected key verbatim leaks the client's secret into the server
+    log. A truncated SHA-256 digest lets operators correlate repeated
+    rejections of the same key without exposing the key itself. surrogatepass
+    matches compare_keys() so any str the auth path accepts can be
+    fingerprinted, including lone surrogates from json escape sequences.
+
+    Args:
+        api_key: The (untrusted) key to fingerprint. Empty string is allowed.
+
+    Returns:
+        The first 8 hex characters of the SHA-256 digest of the UTF-8 bytes.
+    """
+    digest = hashlib.sha256(api_key.encode("utf-8", "surrogatepass")).hexdigest()
+    return digest[:8]
+
+
 def verify_api_key(api_key: str, server_api_key: str) -> bool:
     """Verify an API key using constant-time comparison.
 
-    This function uses secrets.compare_digest to prevent timing attacks
+    This function uses constant-time comparison to prevent timing attacks
     when comparing the provided API key with the server's API key.
 
     Args:
@@ -124,7 +201,7 @@ def verify_api_key(api_key: str, server_api_key: str) -> bool:
     """
     if not api_key or not server_api_key:
         return False
-    return secrets.compare_digest(api_key, server_api_key)
+    return compare_keys(api_key, server_api_key)
 
 
 def verify_any_api_key(api_key: str, main_key: str, sub_keys: list) -> bool:
@@ -144,13 +221,108 @@ def verify_any_api_key(api_key: str, main_key: str, sub_keys: list) -> bool:
     if not api_key:
         return False
     # Check main key
-    if main_key and secrets.compare_digest(api_key, main_key):
+    if main_key and compare_keys(api_key, main_key):
         return True
     # Check sub keys
     for sk in sub_keys:
-        if sk.key and secrets.compare_digest(api_key, sk.key):
+        if sk.key and compare_keys(api_key, sk.key):
             return True
     return False
+
+
+# Wrong API keys allowed per remote client before each lockout.
+KEY_FAILURES_PER_LOCKOUT = 8
+KEY_FIRST_LOCKOUT_SECONDS = 30
+KEY_REPEAT_LOCKOUT_SECONDS = 300
+_MAX_TRACKED_CLIENTS = 4096
+
+
+@dataclass(slots=True)
+class _KeyFailures:
+    failures: int = 0
+    locked_before: bool = False
+    locked_until: float = 0.0
+
+
+# Insertion order is least recently failed first.
+_key_failures: dict[str, _KeyFailures] = {}
+_key_failures_lock = threading.Lock()
+
+
+class KeyLockout(HTTPException):
+    """Raised while a client is locked out after repeated wrong API keys."""
+
+    def __init__(self, retry_after: int) -> None:
+        super().__init__(
+            status_code=429,
+            detail=f"Too many wrong API keys. Try again in {retry_after}s.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+
+def _client_key(conn: HTTPConnection) -> str | None:
+    """Return the failure-budget key for a client, or None for this machine."""
+    host = getattr(getattr(conn, "client", None), "host", None)
+    if not isinstance(host, str):
+        return "unknown"
+    # A peer with the local socket address is this machine on a LAN-IP bind.
+    server = getattr(conn, "scope", {}).get("server") or (None,)
+    if is_loopback_bind_host(host) or host == server[0]:
+        return None
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    # Count an IPv4 client the same on IPv4 and dual-stack sockets.
+    return str(getattr(address, "ipv4_mapped", None) or address)
+
+
+def check_api_key(conn: HTTPConnection, verify: Callable[[], bool]) -> bool:
+    """Run one API key comparison under the client's failure budget.
+
+    Every endpoint that accepts an API key calls this, so all of them share
+    one budget per client. A locked-out client gets KeyLockout before the
+    key is compared. Clients on this machine are not limited.
+    """
+    client = _client_key(conn)
+    if client is None:
+        return verify()
+    with _key_failures_lock:
+        now = time.monotonic()
+        state = _key_failures.get(client)
+        if state is not None and state.locked_until > now:
+            raise KeyLockout(math.ceil(state.locked_until - now))
+        if verify():
+            _key_failures.pop(client, None)
+            return True
+        if state is None:
+            if len(_key_failures) >= _MAX_TRACKED_CLIENTS:
+                # Drop active lockouts only when no other entry is left.
+                oldest = next(
+                    (k for k, v in _key_failures.items() if v.locked_until <= now),
+                    next(iter(_key_failures)),
+                )
+                del _key_failures[oldest]
+            state = _key_failures[client] = _KeyFailures()
+        else:
+            _key_failures[client] = _key_failures.pop(client)
+        state.failures += 1
+        if state.failures >= KEY_FAILURES_PER_LOCKOUT:
+            seconds = (
+                KEY_REPEAT_LOCKOUT_SECONDS
+                if state.locked_before
+                else KEY_FIRST_LOCKOUT_SECONDS
+            )
+            state.failures = 0
+            state.locked_before = True
+            state.locked_until = now + seconds
+            logger.warning(
+                "Locked out %s for %ds after %d wrong API keys",
+                client,
+                seconds,
+                KEY_FAILURES_PER_LOCKOUT,
+            )
+        return False
 
 
 def validate_api_key(api_key: str) -> tuple[bool, str]:
@@ -160,6 +332,14 @@ def validate_api_key(api_key: str) -> tuple[bool, str]:
     - Minimum 4 characters
     - No whitespace characters (space, tab, newline, etc.)
     - Printable characters only (no control characters)
+    - ASCII characters only
+
+    The ASCII-only rule is not cosmetic: HTTP request headers are decoded as
+    latin-1 by the ASGI layer, so a client cannot transmit a non-ASCII key
+    intact. A configured key such as "café" therefore starts the server
+    fine but can never be matched over the wire, yielding silent 401s on every
+    authenticated request. Rejecting it at configuration time surfaces the
+    misconfiguration immediately instead.
 
     Args:
         api_key: The API key string to validate.
@@ -173,6 +353,8 @@ def validate_api_key(api_key: str) -> tuple[bool, str]:
         return False, "API key must not contain whitespace"
     if not api_key.isprintable():
         return False, "API key must contain only printable characters"
+    if not api_key.isascii():
+        return False, "API key must contain only ASCII characters"
     return True, ""
 
 
@@ -193,11 +375,20 @@ def verify_session(request: Request) -> bool:
     return verify_session_token(token)
 
 
+def _bearer_token(request: Request) -> Optional[str]:
+    """Return the Bearer token from the Authorization header, if any."""
+    scheme, _, token = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() != "bearer":
+        return None
+    return token.strip()
+
+
 async def require_admin(request: Request) -> bool:
     """FastAPI dependency to require admin authentication.
 
     This dependency can be used in route definitions to protect
-    admin-only endpoints. It checks for a valid session cookie.
+    admin-only endpoints. It accepts a valid session cookie or the main
+    API key as a Bearer token.
 
     Args:
         request: The FastAPI request object (injected by FastAPI).
@@ -214,17 +405,47 @@ async def require_admin(request: Request) -> bool:
         ... async def get_settings(is_admin: bool = Depends(require_admin)):
         ...     return {"settings": "..."}
     """
-    if not verify_session(request):
-        # Browser requests (Accept: text/html) get redirected to login page
-        accept = request.headers.get("accept", "")
-        if "text/html" in accept:
-            raise _RedirectToLogin()
+    # Skip admin auth when skip_api_key_verification is enabled
+    if _get_global_settings is not None:
+        gs = _get_global_settings()
+        if gs is not None and gs.auth.skip_api_key_verification:
+            from ..server import _server_state
+            from ..utils.network import is_loopback_bind
+
+            active_host = gs.server.host
+            if getattr(_server_state, "global_settings", None) is gs:
+                bind_host = getattr(_server_state, "bind_host", None)
+                if isinstance(bind_host, str):
+                    active_host = bind_host
+            if is_loopback_bind(active_host):
+                return True
+
+    if verify_session(request):
+        return True
+
+    token = _bearer_token(request)
+    if token is not None:
+        gs = _get_global_settings() if _get_global_settings is not None else None
+        main_key = gs.auth.api_key if gs is not None else None
+        # Main key only: sub keys are for the inference API.
+        if main_key and check_api_key(request, lambda: verify_api_key(token, main_key)):
+            return True
+        logger.warning("Rejected admin API key (fp=%s)", fingerprint_key(token))
         raise HTTPException(
             status_code=401,
-            detail="Admin authentication required",
-            headers={"WWW-Authenticate": "Cookie"},
+            detail="Invalid API key",
+            headers={"WWW-Authenticate": "Bearer"},
         )
-    return True
+
+    # Browser requests (Accept: text/html) get redirected to login page
+    accept = request.headers.get("accept", "")
+    if "text/html" in accept and _web_ui_enabled:
+        raise _RedirectToLogin()
+    raise HTTPException(
+        status_code=401,
+        detail="Admin authentication required",
+        headers={"WWW-Authenticate": "Cookie"},
+    )
 
 
 class _RedirectToLogin(Exception):

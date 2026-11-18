@@ -7,9 +7,12 @@ text completions, tool calling, and structured output.
 """
 
 import json
+
 import pytest
 from pydantic import ValidationError
 
+from omlx.api.anthropic_models import MessagesRequest as AnthropicMessagesRequest
+from omlx.api.audio_models import AudioSpeechRequest
 from omlx.api.openai_models import (
     AssistantMessage,
     ChatCompletionChoice,
@@ -32,6 +35,7 @@ from omlx.api.openai_models import (
     ToolDefinition,
     Usage,
 )
+from omlx.api.responses_models import ResponsesRequest
 
 
 class TestContentPart:
@@ -57,6 +61,20 @@ class TestContentPart:
 
         assert part.type == "text"
         assert part.text is None
+
+    def test_file_content_part(self):
+        """Test creating file content part for document preprocessing."""
+        part = ContentPart(
+            type="file",
+            file={
+                "filename": "sample.pdf",
+                "file_data": "data:application/pdf;base64,ZA==",
+            },
+        )
+
+        assert part.type == "file"
+        assert part.file.filename == "sample.pdf"
+        assert part.file.file_data.endswith("ZA==")
 
 
 class TestMessage:
@@ -155,12 +173,27 @@ class TestFunctionCallAndToolCall:
         assert fc.name == "no_args"
         assert fc.arguments == "{}"
 
+    def test_function_call_strips_name_whitespace(self):
+        """Model-emitted function names must not include incidental whitespace."""
+        fc = FunctionCall(name="Bash\n\n", arguments={})
+
+        assert fc.name == "Bash"
+        assert fc.arguments == "{}"
+
+    def test_function_call_rejects_non_string_name(self):
+        """Name normalization must not widen FunctionCall.name beyond str."""
+        for name in (None, 123, {"name": "Bash"}, ["Bash"]):
+            with pytest.raises(ValidationError):
+                FunctionCall(name=name, arguments={})
+
     def test_tool_call(self):
         """Test creating tool call."""
         tc = ToolCall(
             id="call_abc123",
             type="function",
-            function=FunctionCall(name="get_weather", arguments='{"location": "Tokyo"}'),
+            function=FunctionCall(
+                name="get_weather", arguments='{"location": "Tokyo"}'
+            ),
         )
 
         assert tc.id == "call_abc123"
@@ -175,6 +208,131 @@ class TestFunctionCallAndToolCall:
         )
 
         assert tc.type == "function"
+
+
+class TestFunctionCallArgumentsValidation:
+    """Tests for FunctionCall.arguments JSON-object validator.
+
+    Native tool-calling chat templates iterate `arguments.items()`, which
+    requires the echoed value to parse back into a dict. Malformed inputs
+    must be rejected at the request boundary with a 422-friendly ValueError.
+    """
+
+    def test_accepts_empty_string_as_empty_object(self):
+        """Some clients send ``""`` — normalize to ``"{}"`` instead of rejecting."""
+        fc = FunctionCall(name="f", arguments="")
+        assert fc.arguments == "{}"
+
+    def test_accepts_whitespace_only_string(self):
+        """Whitespace-only input normalizes to ``"{}"`` too."""
+        fc = FunctionCall(name="f", arguments="   ")
+        assert fc.arguments == "{}"
+
+    def test_accepts_dict_and_serializes(self):
+        """Some clients wrongly send a dict; coerce to JSON string instead of 422."""
+        fc = FunctionCall(name="f", arguments={"a": 1, "b": "x"})
+        assert json.loads(fc.arguments) == {"a": 1, "b": "x"}
+
+    def test_rejects_invalid_json(self):
+        """Truncated or otherwise malformed JSON must raise."""
+        with pytest.raises(ValidationError) as exc:
+            FunctionCall(name="f", arguments='{"a": "b')
+        msg = str(exc.value)
+        assert "valid JSON" in msg
+
+    def test_rejects_python_repr_with_single_quotes(self):
+        """``{'a': 1}`` is not valid JSON and must be rejected."""
+        with pytest.raises(ValidationError):
+            FunctionCall(name="f", arguments="{'a': 1}")
+
+    def test_rejects_bare_string(self):
+        """``"Tokyo"`` parses as a JSON string, not an object — reject."""
+        with pytest.raises(ValidationError) as exc:
+            FunctionCall(name="f", arguments='"Tokyo"')
+        assert "JSON object" in str(exc.value)
+
+    def test_rejects_json_array(self):
+        """Arrays are valid JSON but not objects; reject."""
+        with pytest.raises(ValidationError) as exc:
+            FunctionCall(name="f", arguments="[1, 2, 3]")
+        assert "JSON object" in str(exc.value)
+
+    def test_rejects_plain_text(self):
+        """Plain text that isn't JSON at all — reject."""
+        with pytest.raises(ValidationError):
+            FunctionCall(name="f", arguments="Tokyo")
+
+    def test_rejects_numeric_type(self):
+        """Non-string, non-dict types are rejected."""
+        with pytest.raises(ValidationError):
+            FunctionCall(name="f", arguments=123)
+
+
+class TestMessageToolCallsArgumentsValidation:
+    """Tests that Message.tool_calls validates nested arguments.
+
+    Since tool_calls is typed as List[dict], Pydantic does not transitively
+    run FunctionCall's own validator on the nested entries. A Message-level
+    validator rejects malformed echoes so downstream template rendering is
+    safe.
+    """
+
+    def test_valid_tool_calls_accepted(self):
+        msg = Message(
+            role="assistant",
+            content=None,
+            tool_calls=[
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "f", "arguments": '{"a": 1}'},
+                }
+            ],
+        )
+        assert msg.tool_calls[0]["function"]["arguments"] == '{"a": 1}'
+
+    def test_empty_arguments_normalized(self):
+        msg = Message(
+            role="assistant",
+            tool_calls=[{"function": {"name": "f", "arguments": ""}}],
+        )
+        assert msg.tool_calls[0]["function"]["arguments"] == "{}"
+
+    def test_dict_arguments_coerced(self):
+        msg = Message(
+            role="assistant",
+            tool_calls=[{"function": {"name": "f", "arguments": {"a": 1}}}],
+        )
+        assert json.loads(msg.tool_calls[0]["function"]["arguments"]) == {"a": 1}
+
+    def test_malformed_json_rejected(self):
+        with pytest.raises(ValidationError):
+            Message(
+                role="assistant",
+                tool_calls=[{"function": {"name": "f", "arguments": '{"a":'}}],
+            )
+
+    def test_python_repr_rejected(self):
+        with pytest.raises(ValidationError):
+            Message(
+                role="assistant",
+                tool_calls=[{"function": {"name": "f", "arguments": "{'a': 1}"}}],
+            )
+
+    def test_plain_text_rejected(self):
+        with pytest.raises(ValidationError):
+            Message(
+                role="assistant",
+                tool_calls=[{"function": {"name": "f", "arguments": "Tokyo"}}],
+            )
+
+    def test_missing_arguments_key_allowed(self):
+        """Some payloads omit arguments entirely — don't invent a failure."""
+        msg = Message(
+            role="assistant",
+            tool_calls=[{"function": {"name": "f"}}],
+        )
+        assert msg.tool_calls[0]["function"] == {"name": "f"}
 
 
 class TestToolDefinition:
@@ -296,6 +454,31 @@ class TestChatCompletionRequest:
         assert len(req.tools) == 1
         assert req.tool_choice == "auto"
 
+    def test_max_completion_tokens_alias(self):
+        """Test OpenAI max_completion_tokens maps to max_tokens."""
+        req = ChatCompletionRequest.model_validate(
+            {
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_completion_tokens": 65536,
+            }
+        )
+
+        assert req.max_tokens == 65536
+
+    def test_max_tokens_preferred_over_alias(self):
+        """Test canonical max_tokens wins when both aliases are present."""
+        req = ChatCompletionRequest.model_validate(
+            {
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 4096,
+                "max_completion_tokens": 65536,
+            }
+        )
+
+        assert req.max_tokens == 4096
+
     def test_request_validation_requires_model(self):
         """Test that model is required."""
         with pytest.raises(ValidationError):
@@ -320,6 +503,111 @@ class TestChatCompletionRequest:
 
         assert data["model"] == "gpt-4"
         assert data["messages"][0]["role"] == "user"
+
+    def test_top_level_enable_thinking_normalizes_to_template_kwargs(self):
+        """Top-level compatibility input must reach the template renderer."""
+        req = ChatCompletionRequest(
+            model="reasoning-model",
+            messages=[Message(role="user", content="Hello")],
+            enable_thinking=False,
+            thinking_budget=0,
+            chat_template_kwargs={"reasoning_effort": "low"},
+        )
+
+        assert req.enable_thinking is False
+        assert req.thinking_budget == 0
+        assert req.chat_template_kwargs == {
+            "enable_thinking": False,
+            "reasoning_effort": "low",
+        }
+
+    @pytest.mark.parametrize("watts", [0, 1, 1001])
+    def test_gpu_power_limit_rejects_out_of_range_watts(self, watts):
+        # A 0 W target parks the GPU at its lowest clock; it is not "off".
+        with pytest.raises(ValidationError):
+            ChatCompletionRequest(model="m", messages=[], gpu_power_limit_w=watts)
+
+    @pytest.mark.parametrize("enabled", [True, False])
+    def test_matching_thinking_alias_preserves_input(self, enabled):
+        template_kwargs = {"enable_thinking": enabled, "custom": "value"}
+        request = ChatCompletionRequest(
+            model="test", messages=[], enable_thinking=enabled,
+            chat_template_kwargs=template_kwargs,
+        )
+        assert request.chat_template_kwargs == template_kwargs
+        assert template_kwargs == {"enable_thinking": enabled, "custom": "value"}
+
+    def test_nested_thinking_without_alias_is_unchanged(self):
+        request = ChatCompletionRequest(
+            model="test", messages=[], chat_template_kwargs={"enable_thinking": False}
+        )
+        assert request.enable_thinking is None
+        assert request.chat_template_kwargs == {"enable_thinking": False}
+
+    def test_top_level_enable_thinking_rejects_nested_conflict(self):
+        """Conflicting control paths must fail instead of choosing silently."""
+        with pytest.raises(ValidationError, match="enable_thinking conflicts"):
+            ChatCompletionRequest(
+                model="reasoning-model",
+                messages=[Message(role="user", content="Hello")],
+                enable_thinking=False,
+                chat_template_kwargs={"enable_thinking": True},
+            )
+
+    def test_xtc_defaults_to_none(self):
+        """Test XTC params default to None (not sent by client)."""
+        req = ChatCompletionRequest(
+            model="gpt-4",
+            messages=[Message(role="user", content="Hello")],
+        )
+        assert req.xtc_probability is None
+        assert req.xtc_threshold is None
+
+    def test_xtc_accepted(self):
+        """Test XTC params are accepted in request."""
+        req = ChatCompletionRequest(
+            model="gpt-4",
+            messages=[Message(role="user", content="Hello")],
+            xtc_probability=0.5,
+            xtc_threshold=0.1,
+        )
+        assert req.xtc_probability == 0.5
+        assert req.xtc_threshold == 0.1
+
+    def test_guided_grammar_accepted(self):
+        """Test guided_grammar is accepted as a grammar alias."""
+        req = ChatCompletionRequest(
+            model="gpt-4",
+            messages=[Message(role="user", content="Hello")],
+            guided_grammar='root ::= "YES"',
+        )
+        assert req.guided_grammar == 'root ::= "YES"'
+
+    def test_reasoning_effort_accepted(self):
+        req = ChatCompletionRequest(
+            model="Qwen3.8-27B",
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="xhigh",
+        )
+
+        assert req.reasoning_effort == "xhigh"
+
+    def test_reasoning_effort_accepts_numbers(self):
+        """Numeric effort (Inkling 0.1-0.99) must survive validation as-is."""
+        req_float = ChatCompletionRequest(
+            model="Inkling-Small",
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort=0.9,
+        )
+        assert req_float.reasoning_effort == 0.9
+        assert isinstance(req_float.reasoning_effort, float)
+
+        req_int = ChatCompletionRequest(
+            model="Inkling-Small",
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort=1,
+        )
+        assert req_int.reasoning_effort == 1
 
 
 class TestChatCompletionResponse:
@@ -481,6 +769,61 @@ class TestChatCompletionChunk:
 class TestCompletionModels:
     """Tests for text completion models."""
 
+    def test_repetition_context_size_defaults_to_none(self):
+        """The penalty window rides along only when a client sends it."""
+        chat = ChatCompletionRequest.model_validate(
+            {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+        )
+        completion = CompletionRequest(model="m", prompt="hello")
+        assert chat.repetition_context_size is None
+        assert completion.repetition_context_size is None
+
+    def test_repetition_context_size_is_kept_and_validated(self):
+        chat = ChatCompletionRequest.model_validate(
+            {
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "repetition_context_size": 128,
+            }
+        )
+        assert chat.repetition_context_size == 128
+
+        with pytest.raises(ValidationError):
+            ChatCompletionRequest.model_validate(
+                {
+                    "model": "m",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "repetition_context_size": 0,
+                }
+            )
+
+        with pytest.raises(ValidationError):
+            CompletionRequest.model_validate(
+                {
+                    "model": "m",
+                    "prompt": "hello",
+                    "repetition_context_size": 0,
+                }
+            )
+
+    def test_ngram_window_shorter_than_ngram_is_rejected(self):
+        fields = {"no_repeat_ngram_size": 35, "ngram_window": 34}
+        with pytest.raises(ValidationError):
+            ChatCompletionRequest.model_validate(
+                {"model": "m", "messages": [{"role": "user", "content": "hi"}]} | fields
+            )
+        with pytest.raises(ValidationError):
+            CompletionRequest.model_validate({"model": "m", "prompt": "hi"} | fields)
+
+    def test_ignore_eos_defaults_off_and_parses(self):
+        chat = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+        completion = {"model": "m", "prompt": "hi"}
+        assert ChatCompletionRequest.model_validate(chat).ignore_eos is False
+        assert CompletionRequest.model_validate(completion).ignore_eos is False
+        on = {"ignore_eos": True}
+        assert ChatCompletionRequest.model_validate(chat | on).ignore_eos is True
+        assert CompletionRequest.model_validate(completion | on).ignore_eos is True
+
     def test_completion_request(self):
         """Test creating completion request."""
         req = CompletionRequest(
@@ -501,6 +844,26 @@ class TestCompletionModels:
 
         assert isinstance(req.prompt, list)
         assert len(req.prompt) == 2
+
+    def test_completion_request_xtc_defaults_to_none(self):
+        """Test XTC params default to None on CompletionRequest."""
+        req = CompletionRequest(
+            model="gpt-3.5-turbo-instruct",
+            prompt="Hello",
+        )
+        assert req.xtc_probability is None
+        assert req.xtc_threshold is None
+
+    def test_completion_request_xtc_accepted(self):
+        """Test XTC params are accepted in CompletionRequest."""
+        req = CompletionRequest(
+            model="gpt-3.5-turbo-instruct",
+            prompt="Hello",
+            xtc_probability=0.3,
+            xtc_threshold=0.2,
+        )
+        assert req.xtc_probability == 0.3
+        assert req.xtc_threshold == 0.2
 
     def test_completion_response(self):
         """Test creating completion response."""
@@ -569,6 +932,7 @@ class TestModelInfo:
 # Stop Field Coercion
 # =============================================================================
 
+
 class TestStopCoercion:
     """Tests for stop field string-to-list coercion (OpenAI compat)."""
 
@@ -615,3 +979,41 @@ class TestStopCoercion:
             stop=["a"],
         )
         assert req.stop == ["a"]
+
+
+_USER_MESSAGES = [{"role": "user", "content": "hi"}]
+
+
+@pytest.mark.parametrize(
+    ("model_cls", "payload"),
+    [
+        (ChatCompletionRequest, {"messages": _USER_MESSAGES, "max_tokens": 0}),
+        (
+            ChatCompletionRequest,
+            {"messages": _USER_MESSAGES, "max_completion_tokens": -1},
+        ),
+        (CompletionRequest, {"prompt": "hi", "max_tokens": -1}),
+        (AnthropicMessagesRequest, {"messages": _USER_MESSAGES, "max_tokens": 0}),
+        (ResponsesRequest, {"input": "hi", "max_output_tokens": -1}),
+        (AudioSpeechRequest, {"input": "hi", "max_tokens": 0}),
+    ],
+)
+def test_output_token_caps_must_be_positive(model_cls, payload):
+    with pytest.raises(ValidationError):
+        model_cls.model_validate({"model": "m", **payload})
+
+
+def test_chat_request_top_logprobs_requires_logprobs():
+    messages = [{"role": "user", "content": "hi"}]
+    with pytest.raises(ValidationError, match="top_logprobs requires logprobs"):
+        ChatCompletionRequest(model="m", messages=messages, top_logprobs=3)
+    with pytest.raises(ValidationError):
+        ChatCompletionRequest(
+            model="m", messages=messages, logprobs=True, top_logprobs=21
+        )
+    request = ChatCompletionRequest(
+        model="m", messages=messages, logprobs=True, top_logprobs=0
+    )
+    assert request.logprobs is True
+    request = ChatCompletionRequest(model="m", messages=messages, logprobs=None)
+    assert not request.logprobs

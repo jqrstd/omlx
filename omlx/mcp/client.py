@@ -20,6 +20,23 @@ from .types import (
 
 logger = logging.getLogger(__name__)
 
+_MISSING = object()
+
+
+def _sdk_attr(obj: Any, *names: str, default: Any = None) -> Any:
+    """Read the first present attribute among ``names``.
+
+    The mcp SDK renamed its result fields from camelCase to snake_case in
+    2.0 (protocol revision 2026-07-28). Accepting both spellings keeps the
+    client working across SDK versions instead of raising AttributeError
+    (or silently falling back) on one of them.
+    """
+    for name in names:
+        value = getattr(obj, name, _MISSING)
+        if value is not _MISSING:
+            return value
+    return default
+
 
 class MCPClient:
     """
@@ -99,6 +116,8 @@ class MCPClient:
                     await self._connect_stdio()
                 elif self.config.transport == MCPTransport.SSE:
                     await self._connect_sse()
+                elif self.config.transport == MCPTransport.STREAMABLE_HTTP:
+                    await self._connect_streamable_http()
                 else:
                     raise ValueError(f"Unknown transport: {self.config.transport}")
 
@@ -120,6 +139,7 @@ class MCPClient:
                 self._state = MCPServerState.ERROR
                 self._error = str(e)
                 logger.error(f"Failed to connect to MCP server '{self.name}': {e}")
+                await self._cleanup_resources()
                 return False
 
     async def _connect_stdio(self):
@@ -136,15 +156,20 @@ class MCPClient:
             command=self.config.command,
             args=self.config.args or [],
             env=self.config.env,
+            cwd=self.config.cwd,
         )
 
         # Create stdio client context
         self._stdio_client = stdio_client(server_params)
         self._read, self._write = await self._stdio_client.__aenter__()
 
-        # Create session
-        self._session = ClientSession(self._read, self._write)
-        await self._session.__aenter__()
+        try:
+            self._session = ClientSession(self._read, self._write)
+            await self._session.__aenter__()
+        except Exception:
+            await self._stdio_client.__aexit__(None, None, None)
+            self._stdio_client = None
+            raise
 
     async def _connect_sse(self):
         """Connect via SSE transport."""
@@ -157,12 +182,49 @@ class MCPClient:
             )
 
         # Create SSE client context
-        self._sse_client = sse_client(self.config.url)
+        self._sse_client = sse_client(self.config.url, headers=self.config.headers)
         self._read, self._write = await self._sse_client.__aenter__()
 
-        # Create session
-        self._session = ClientSession(self._read, self._write)
-        await self._session.__aenter__()
+        try:
+            self._session = ClientSession(self._read, self._write)
+            await self._session.__aenter__()
+        except Exception:
+            await self._sse_client.__aexit__(None, None, None)
+            self._sse_client = None
+            raise
+
+    async def _connect_streamable_http(self):
+        """Connect via streamable_http transport."""
+        try:
+            from mcp import ClientSession
+            from mcp.client.streamable_http import streamable_http_client
+            import httpx
+        except ImportError:
+            raise ImportError(
+                "MCP SDK required for MCP support. Install with: pip install mcp"
+            )
+
+        headers = self.config.headers or {}
+        self._http_client = httpx.AsyncClient(headers=headers)
+        await self._http_client.__aenter__()
+
+        try:
+            self._streamable_http_client = streamable_http_client(
+                url=self.config.url, http_client=self._http_client
+            )
+            self._read, self._write = await self._streamable_http_client.__aenter__()
+            self._session = ClientSession(self._read, self._write)
+            await self._session.__aenter__()
+        except Exception:
+            if (
+                hasattr(self, "_streamable_http_client")
+                and self._streamable_http_client
+            ):
+                await self._streamable_http_client.__aexit__(None, None, None)
+                self._streamable_http_client = None
+            await self._http_client.__aexit__(None, None, None)
+            self._http_client = None
+            raise
 
     async def _initialize_session(self):
         """Initialize the MCP session."""
@@ -171,10 +233,14 @@ class MCPClient:
 
         # Initialize with capabilities
         result = await self._session.initialize()
+        protocol = _sdk_attr(
+            result, "protocol_version", "protocolVersion", default="unknown"
+        )
+        server_info = _sdk_attr(result, "server_info", "serverInfo")
         logger.debug(
             f"MCP server '{self.name}' initialized: "
-            f"protocol={result.protocolVersion}, "
-            f"server={result.serverInfo.name if result.serverInfo else 'unknown'}"
+            f"protocol={protocol}, "
+            f"server={server_info.name if server_info else 'unknown'}"
         )
 
     async def _discover_tools(self):
@@ -191,7 +257,9 @@ class MCPClient:
                     server_name=self.name,
                     name=tool.name,
                     description=tool.description or "",
-                    input_schema=tool.inputSchema if hasattr(tool, 'inputSchema') else {},
+                    input_schema=_sdk_attr(
+                        tool, "input_schema", "inputSchema", default={}
+                    ),
                 )
                 self._tools.append(mcp_tool)
                 logger.debug(f"Discovered tool: {mcp_tool.full_name}")
@@ -200,6 +268,35 @@ class MCPClient:
             logger.warning(f"Failed to discover tools from '{self.name}': {e}")
             self._tools = []
 
+    async def _cleanup_resources(self):
+        """Clean up connection resources without acquiring lock."""
+        try:
+            if self._session:
+                await self._session.__aexit__(None, None, None)
+                self._session = None
+
+            if hasattr(self, "_stdio_client") and self._stdio_client:
+                await self._stdio_client.__aexit__(None, None, None)
+                self._stdio_client = None
+
+            if hasattr(self, "_sse_client") and self._sse_client:
+                await self._sse_client.__aexit__(None, None, None)
+                self._sse_client = None
+
+            if (
+                hasattr(self, "_streamable_http_client")
+                and self._streamable_http_client
+            ):
+                await self._streamable_http_client.__aexit__(None, None, None)
+                self._streamable_http_client = None
+
+            if hasattr(self, "_http_client") and self._http_client:
+                await self._http_client.__aexit__(None, None, None)
+                self._http_client = None
+
+        except Exception as e:
+            logger.warning(f"Error cleaning up resources for '{self.name}': {e}")
+
     async def disconnect(self):
         """Disconnect from the MCP server."""
         async with self._lock:
@@ -207,21 +304,7 @@ class MCPClient:
                 return
 
             try:
-                if self._session:
-                    await self._session.__aexit__(None, None, None)
-                    self._session = None
-
-                if hasattr(self, '_stdio_client') and self._stdio_client:
-                    await self._stdio_client.__aexit__(None, None, None)
-                    self._stdio_client = None
-
-                if hasattr(self, '_sse_client') and self._sse_client:
-                    await self._sse_client.__aexit__(None, None, None)
-                    self._sse_client = None
-
-            except Exception as e:
-                logger.warning(f"Error disconnecting from '{self.name}': {e}")
-
+                await self._cleanup_resources()
             finally:
                 self._state = MCPServerState.DISCONNECTED
                 self._tools = []
@@ -275,7 +358,9 @@ class MCPClient:
             return MCPToolResult(
                 tool_name=tool_name,
                 content=content,
-                is_error=result.isError if hasattr(result, 'isError') else False,
+                is_error=bool(
+                    _sdk_attr(result, "is_error", "isError", default=False)
+                ),
             )
 
         except asyncio.TimeoutError:
@@ -295,16 +380,36 @@ class MCPClient:
 
     def _extract_content(self, result) -> Any:
         """Extract content from MCP tool result."""
-        if not hasattr(result, 'content') or not result.content:
+        if not hasattr(result, "content") or not result.content:
+            # Fall back to structured content if available
+            structured = _sdk_attr(
+                result, "structured_content", "structuredContent"
+            )
+            if structured:
+                return structured
             return None
 
         # Handle list of content items
         contents = []
         for item in result.content:
-            if hasattr(item, 'text'):
+            if hasattr(item, "text"):
                 contents.append(item.text)
-            elif hasattr(item, 'data'):
-                contents.append(item.data)
+            elif hasattr(item, "data"):
+                # Image/audio blocks: keep the media type next to the payload.
+                # Flattened to a bare base64 string it is indistinguishable
+                # from text, so a caller has no way to render it -- and ends up
+                # handing ~1MB of base64 to the model instead of an image.
+                mime = _sdk_attr(item, "mime_type", "mimeType")
+                if mime:
+                    contents.append(
+                        {
+                            "type": _sdk_attr(item, "type", default="image"),
+                            "mime_type": mime,
+                            "data": item.data,
+                        }
+                    )
+                else:
+                    contents.append(item.data)
             else:
                 contents.append(str(item))
 

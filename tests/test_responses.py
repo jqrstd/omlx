@@ -15,21 +15,22 @@ from omlx.api.responses_models import (
     TextFormatConfig,
 )
 from omlx.api.responses_utils import (
-    ResponseStore,
     ResponseStateCorruptError,
     ResponseStateNotFoundError,
+    ResponseStore,
     build_function_call_output_item,
     build_message_output_item,
-    build_response_usage,
+    build_reasoning_output_item,
     build_response_store_record,
+    build_response_usage,
     convert_responses_input_to_messages,
     convert_responses_tools,
     convert_stored_response_to_messages,
     format_sse_event,
     normalize_response_output_to_messages,
+    split_namespace_tool_name,
 )
 from omlx.api.shared_models import IDPrefix, generate_id
-
 
 # =============================================================================
 # ID Generation Tests
@@ -46,6 +47,11 @@ class TestIDGeneration:
         fid = generate_id(IDPrefix.FUNCTION_CALL)
         assert fid.startswith("fc_")
         assert len(fid) == 11  # "fc_" + 8 hex chars
+
+    def test_reasoning_id_prefix(self):
+        rid = generate_id(IDPrefix.REASONING)
+        assert rid.startswith("rs_")
+        assert len(rid) == 27  # "rs_" + 24 hex chars
 
     def test_unique_ids(self):
         ids = {generate_id(IDPrefix.RESPONSE) for _ in range(100)}
@@ -155,6 +161,19 @@ class TestConvertResponsesInput:
         assert "Rule 1" in messages[0]["content"]
         assert "Rule 2" in messages[0]["content"]
 
+    def test_developer_position_can_be_deferred(self):
+        """Server path can preserve developer/system position until template probe."""
+        items = [
+            InputItem(role="user", content="Hi"),
+            InputItem(role="developer", content="Plan mode"),
+        ]
+        messages = convert_responses_input_to_messages(
+            items,
+            consolidate_system_messages=False,
+        )
+        assert [m["role"] for m in messages] == ["user", "system"]
+        assert messages[1]["content"] == "Plan mode"
+
     def test_function_call_items(self):
         items = [
             InputItem(type="message", role="user", content="What's the weather?"),
@@ -178,7 +197,9 @@ class TestConvertResponsesInput:
         assert len(messages[1]["tool_calls"]) == 1
         assert messages[1]["tool_calls"][0]["function"]["name"] == "get_weather"
         # arguments should be parsed as dict (not string) for Jinja2 chat templates
-        assert messages[1]["tool_calls"][0]["function"]["arguments"] == {"location": "Paris"}
+        assert messages[1]["tool_calls"][0]["function"]["arguments"] == {
+            "location": "Paris"
+        }
         # function_call_output → tool message
         assert messages[2]["role"] == "tool"
         assert messages[2]["tool_call_id"] == "call_abc"
@@ -279,24 +300,26 @@ class TestConvertResponsesInput:
         ]
         # Simulate 3 rounds of tool calls (Codex pattern)
         for i in range(3):
-            items.extend([
-                InputItem(
-                    type="message",
-                    role="assistant",
-                    content=[{"type": "output_text", "text": ""}],
-                ),
-                InputItem(
-                    type="function_call",
-                    call_id=f"call_{i}",
-                    name="exec_command",
-                    arguments=f'{{"cmd": "cmd_{i}"}}',
-                ),
-                InputItem(
-                    type="function_call_output",
-                    call_id=f"call_{i}",
-                    output=f"result_{i}",
-                ),
-            ])
+            items.extend(
+                [
+                    InputItem(
+                        type="message",
+                        role="assistant",
+                        content=[{"type": "output_text", "text": ""}],
+                    ),
+                    InputItem(
+                        type="function_call",
+                        call_id=f"call_{i}",
+                        name="exec_command",
+                        arguments=f'{{"cmd": "cmd_{i}"}}',
+                    ),
+                    InputItem(
+                        type="function_call_output",
+                        call_id=f"call_{i}",
+                        output=f"result_{i}",
+                    ),
+                ]
+            )
         messages = convert_responses_input_to_messages(items)
         # Count assistant messages — should be exactly 3 (one per round)
         assistant_msgs = [m for m in messages if m["role"] == "assistant"]
@@ -330,6 +353,82 @@ class TestConvertResponsesInput:
             ),
         ]
         messages = convert_responses_input_to_messages(items)
+        assert messages[0]["content"] == "Hello\nWorld"
+
+    def test_input_image_preserved_as_content_list(self):
+        """input_image parts should be preserved as list for VLM processing."""
+        items = [
+            InputItem(
+                type="message",
+                role="user",
+                content=[
+                    {"type": "input_text", "text": "What is in this image?"},
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/png;base64,abc123",
+                        "detail": "high",
+                    },
+                ],
+            ),
+        ]
+        messages = convert_responses_input_to_messages(items, preserve_images=True)
+        content = messages[0]["content"]
+        # Content should be a list (not flattened to string) when images present
+        assert isinstance(content, list)
+        assert content[0] == {"type": "text", "text": "What is in this image?"}
+        assert content[1] == {
+            "type": "input_image",
+            "image_url": "data:image/png;base64,abc123",
+            "detail": "high",
+        }
+
+    def test_input_image_url_field_fallback(self):
+        """input_image with 'url' field instead of 'image_url' should also work."""
+        items = [
+            InputItem(
+                type="message",
+                role="user",
+                content=[
+                    {"type": "input_text", "text": "Describe"},
+                    {"type": "input_image", "url": "https://example.com/img.png"},
+                ],
+            ),
+        ]
+        messages = convert_responses_input_to_messages(items, preserve_images=True)
+        content = messages[0]["content"]
+        assert isinstance(content, list)
+        assert content[1]["image_url"] == "https://example.com/img.png"
+        assert content[1]["detail"] == "auto"  # default
+
+    def test_input_image_dropped_without_preserve_images(self):
+        """Text engines get a string, as /v1/chat/completions does (#4069)."""
+        items = [
+            InputItem(
+                type="message",
+                role="user",
+                content=[
+                    {"type": "input_text", "text": "Reply OK."},
+                    {"type": "input_image", "image_url": "data:image/png;base64,abc"},
+                ],
+            ),
+        ]
+        messages = convert_responses_input_to_messages(items)
+        assert messages[0]["content"] == "Reply OK."
+
+    def test_text_only_content_parts_flattened(self):
+        """Content with only text parts should still be flattened to string."""
+        items = [
+            InputItem(
+                type="message",
+                role="user",
+                content=[
+                    {"type": "input_text", "text": "Hello"},
+                    {"type": "input_text", "text": "World"},
+                ],
+            ),
+        ]
+        messages = convert_responses_input_to_messages(items)
+        assert isinstance(messages[0]["content"], str)
         assert messages[0]["content"] == "Hello\nWorld"
 
     def test_previous_messages_prepended(self):
@@ -380,6 +479,200 @@ class TestConvertResponsesInput:
         assert messages[0]["content"] == "Previous answer"
         assert messages[1]["tool_calls"][0]["id"] == "call_next"
 
+    def test_reasoning_then_message_attaches_reasoning_content(self):
+        items = [
+            InputItem(
+                type="reasoning",
+                summary=[{"type": "summary_text", "text": "step-by-step"}],
+            ),
+            InputItem(type="message", role="assistant", content="Final answer"),
+        ]
+        messages = convert_responses_input_to_messages(items)
+        assert len(messages) == 1
+        assert messages[0]["role"] == "assistant"
+        assert messages[0]["content"] == "Final answer"
+        assert messages[0]["reasoning_content"] == "step-by-step"
+
+    def test_reasoning_then_function_call_attaches_reasoning_content(self):
+        # Tool-call sequence: reasoning → function_call → function_call_output.
+        # Reasoning must survive into the synthesized assistant tool_calls
+        # message instead of being dropped on the floor.
+        items = [
+            InputItem(
+                type="reasoning",
+                summary=[{"type": "summary_text", "text": "need weather"}],
+            ),
+            InputItem(
+                type="function_call",
+                call_id="call_w",
+                name="get_weather",
+                arguments='{"city":"Paris"}',
+            ),
+            InputItem(type="function_call_output", call_id="call_w", output="sunny"),
+        ]
+        messages = convert_responses_input_to_messages(items)
+        assert len(messages) == 2
+        assert messages[0]["role"] == "assistant"
+        assert messages[0]["tool_calls"][0]["function"]["name"] == "get_weather"
+        assert messages[0]["reasoning_content"] == "need weather"
+        assert messages[1]["role"] == "tool"
+        assert messages[1]["content"] == "sunny"
+
+    def test_reasoning_with_multi_part_summary_joined(self):
+        items = [
+            InputItem(
+                type="reasoning",
+                summary=[
+                    {"type": "summary_text", "text": "line1"},
+                    {"type": "summary_text", "text": "line2"},
+                ],
+            ),
+            InputItem(type="message", role="assistant", content="ok"),
+        ]
+        messages = convert_responses_input_to_messages(items)
+        assert messages[0]["reasoning_content"] == "line1\nline2"
+
+    def test_reasoning_orphan_then_tool_calls_only(self):
+        # reasoning followed by function_call but no function_call_output
+        # in the same input — reasoning still lands on the tool_calls message
+        # when the final flush runs.
+        items = [
+            InputItem(
+                type="reasoning",
+                summary=[{"type": "summary_text", "text": "thinking"}],
+            ),
+            InputItem(
+                type="function_call",
+                call_id="call_x",
+                name="lookup",
+                arguments="{}",
+            ),
+        ]
+        messages = convert_responses_input_to_messages(items)
+        assert len(messages) == 1
+        assert messages[0]["tool_calls"][0]["function"]["name"] == "lookup"
+        assert messages[0]["reasoning_content"] == "thinking"
+
+
+IMAGE_URI = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
+
+
+class TestFunctionCallOutputMultimodal:
+    """Images in function_call_output lists route to VLM, not the prompt (#2989)."""
+
+    def _tool_round(self, outputs):
+        items = [InputItem(type="message", role="user", content="take screenshots")]
+        for i in range(len(outputs)):
+            items.append(
+                InputItem(
+                    type="function_call",
+                    call_id=f"call_{i}",
+                    name="screenshot",
+                    arguments="{}",
+                )
+            )
+        for i, output in enumerate(outputs):
+            items.append(
+                InputItem(
+                    type="function_call_output",
+                    call_id=f"call_{i}",
+                    output=output,
+                )
+            )
+        return items
+
+    def test_image_extracted_to_user_message(self):
+        output = [
+            {"type": "input_text", "text": "screenshot result"},
+            {"type": "input_image", "detail": "auto", "image_url": IMAGE_URI},
+        ]
+        messages = convert_responses_input_to_messages(
+            self._tool_round([output]), preserve_images=True
+        )
+        assert [m["role"] for m in messages] == ["user", "assistant", "tool", "user"]
+        assert messages[2]["content"] == "screenshot result"
+        assert messages[3]["content"] == [
+            {"type": "input_image", "image_url": IMAGE_URI, "detail": "auto"}
+        ]
+
+    def test_parallel_outputs_keep_tool_messages_contiguous(self):
+        output = [
+            {"type": "input_text", "text": "shot"},
+            {"type": "input_image", "detail": "auto", "image_url": IMAGE_URI},
+        ]
+        messages = convert_responses_input_to_messages(
+            self._tool_round([output, output]), preserve_images=True
+        )
+        # Images flush once after the tool run, never between tool messages
+        assert [m["role"] for m in messages] == [
+            "user",
+            "assistant",
+            "tool",
+            "tool",
+            "user",
+        ]
+        assert len(messages[4]["content"]) == 2
+        for msg in messages[2:4]:
+            assert IMAGE_URI not in msg["content"]
+
+    def test_images_flush_before_next_tool_round(self):
+        items = self._tool_round(
+            [[{"type": "input_image", "detail": "auto", "image_url": IMAGE_URI}]]
+        )
+        items.extend(
+            [
+                InputItem(
+                    type="function_call",
+                    call_id="call_next",
+                    name="lookup",
+                    arguments="{}",
+                ),
+                InputItem(
+                    type="function_call_output",
+                    call_id="call_next",
+                    output="done",
+                ),
+            ]
+        )
+        messages = convert_responses_input_to_messages(items, preserve_images=True)
+        assert [m["role"] for m in messages] == [
+            "user",
+            "assistant",
+            "tool",
+            "user",
+            "assistant",
+            "tool",
+        ]
+        assert messages[3]["content"][0]["type"] == "input_image"
+        assert messages[5]["content"] == "done"
+
+    def test_placeholder_without_preserve_images(self):
+        output = [
+            {"type": "input_text", "text": "screenshot result"},
+            {"type": "input_image", "detail": "auto", "image_url": IMAGE_URI},
+        ]
+        messages = convert_responses_input_to_messages(self._tool_round([output]))
+        assert [m["role"] for m in messages] == ["user", "assistant", "tool"]
+        assert messages[2]["content"] == "screenshot result\n(see attached image)"
+        assert IMAGE_URI not in json.dumps(messages)
+
+    def test_plain_json_list_falls_back_to_dumps(self):
+        messages = convert_responses_input_to_messages(
+            self._tool_round([[1, 2, 3]]), preserve_images=True
+        )
+        assert messages[2]["content"] == "[1, 2, 3]"
+        messages = convert_responses_input_to_messages(
+            self._tool_round([["a", "b"]]), preserve_images=True
+        )
+        assert messages[2]["content"] == '["a", "b"]'
+
+    def test_text_only_typed_list_extracted(self):
+        messages = convert_responses_input_to_messages(
+            self._tool_round([[{"type": "input_text", "text": "hello"}]]),
+            preserve_images=True,
+        )
+        assert messages[2]["content"] == "hello"
+
 
 # =============================================================================
 # Tool Conversion Tests
@@ -399,7 +692,10 @@ class TestConvertResponsesTools:
                 type="function",
                 name="get_weather",
                 description="Get weather info",
-                parameters={"type": "object", "properties": {"location": {"type": "string"}}},
+                parameters={
+                    "type": "object",
+                    "properties": {"location": {"type": "string"}},
+                },
             )
         ]
         result = convert_responses_tools(tools)
@@ -411,9 +707,7 @@ class TestConvertResponsesTools:
         assert "parameters" in result[0]["function"]
 
     def test_strict_field(self):
-        tools = [
-            ResponsesTool(name="fn", strict=True)
-        ]
+        tools = [ResponsesTool(name="fn", strict=True)]
         result = convert_responses_tools(tools)
         assert result[0]["function"]["strict"] is True
 
@@ -439,6 +733,143 @@ class TestConvertResponsesTools:
         tools = [ResponsesTool(type="local_shell")]
         result = convert_responses_tools(tools)
         assert result is None
+
+    def test_namespace_tools_are_expanded(self):
+        """Namespace groups hold client-executed function tools (#3371)."""
+        aliases = {}
+        tools = [
+            ResponsesTool(
+                type="namespace",
+                name="mcp__demo__",
+                description="Demo MCP server",
+                tools=[
+                    {
+                        "type": "function",
+                        "name": "get_weather",
+                        "description": "Get the current weather for a city.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"],
+                        },
+                    },
+                    {"type": "function", "name": "get_time"},
+                ],
+            )
+        ]
+        result = convert_responses_tools(tools, aliases)
+        assert result is not None
+        # Wire names join the namespace like Codex's join_tool_name().
+        assert [t["function"]["name"] for t in result] == [
+            "mcp__demo__get_weather",
+            "mcp__demo__get_time",
+        ]
+        assert result[0]["type"] == "function"
+        assert result[0]["function"]["description"] == (
+            "Get the current weather for a city."
+        )
+        assert result[0]["function"]["parameters"]["required"] == ["city"]
+        assert aliases == {
+            "mcp__demo__get_weather": ("mcp__demo__", "get_weather"),
+            "mcp__demo__get_time": ("mcp__demo__", "get_time"),
+        }
+
+    def test_namespace_wire_name_survives_collision(self):
+        """A flat tool already holding the joined name must not be shadowed."""
+        aliases = {}
+        tools = [
+            ResponsesTool(type="function", name="mcp__demo__get_weather"),
+            ResponsesTool(
+                type="namespace",
+                name="mcp__demo__",
+                tools=[{"type": "function", "name": "get_weather"}],
+            ),
+        ]
+        result = convert_responses_tools(tools, aliases)
+        assert [t["function"]["name"] for t in result] == [
+            "mcp__demo__get_weather",
+            "mcp__demo__get_weather_2",
+        ]
+        assert aliases == {"mcp__demo__get_weather_2": ("mcp__demo__", "get_weather")}
+
+    def test_split_namespace_tool_name(self):
+        aliases = {"mcp__demo__get_weather": ("mcp__demo__", "get_weather")}
+        assert split_namespace_tool_name("mcp__demo__get_weather", aliases) == (
+            "mcp__demo__",
+            "get_weather",
+        )
+        # Flat calls, and calls the model invented, pass through unchanged.
+        assert split_namespace_tool_name("get_weather", aliases) == (
+            None,
+            "get_weather",
+        )
+        assert split_namespace_tool_name("get_weather") == (None, "get_weather")
+
+    def test_namespace_serializes_only_when_set(self):
+        namespaced = build_function_call_output_item(
+            name="get_weather",
+            arguments='{"city": "Paris"}',
+            call_id="call_1",
+            namespace="mcp__demo__",
+        ).model_dump()
+        assert namespaced["name"] == "get_weather"
+        assert namespaced["namespace"] == "mcp__demo__"
+        flat = build_function_call_output_item(
+            name="get_weather", arguments="{}", call_id="call_2"
+        ).model_dump()
+        assert "namespace" not in flat
+        # Other optional fields keep serializing as null, as before.
+        assert flat["role"] is None and flat["summary"] is None
+
+    def test_namespace_without_usable_members_contributes_nothing(self):
+        tools = [
+            ResponsesTool(type="namespace", name="empty__"),
+            ResponsesTool(type="namespace", name="junk__", tools=["not-a-tool"]),
+            ResponsesTool(type="function", name="fn_a"),
+        ]
+        result = convert_responses_tools(tools)
+        assert [t["function"]["name"] for t in result] == ["fn_a"]
+
+
+# =============================================================================
+# InputItem Validation Tests
+# =============================================================================
+
+
+class TestInputItemOutputSerialization:
+    """InputItem should accept list/dict output; dict serializes, list survives."""
+
+    def test_list_output_preserved(self):
+        # Lists pass through so multimodal parts stay extractable (#2989)
+        item = InputItem(
+            type="function_call_output",
+            call_id="call_123",
+            output=[{"type": "input_image", "image_url": "data:image/jpeg;base64,abc"}],
+        )
+        assert isinstance(item.output, list)
+        assert item.output[0]["type"] == "input_image"
+
+    def test_dict_output_serialized_to_json(self):
+        item = InputItem(
+            type="function_call_output",
+            call_id="call_456",
+            output={"result": "success", "data": [1, 2, 3]},
+        )
+        assert isinstance(item.output, str)
+        parsed = json.loads(item.output)
+        assert parsed["result"] == "success"
+
+    def test_string_output_unchanged(self):
+        item = InputItem(
+            type="function_call_output",
+            call_id="call_789",
+            output="plain text result",
+        )
+        assert item.output == "plain text result"
+
+    def test_none_output_unchanged(self):
+        item = InputItem(type="function_call_output", call_id="call_000")
+        assert item.output is None
 
 
 # =============================================================================
@@ -473,6 +904,33 @@ class TestBuildOutputItems:
         assert usage.input_tokens == 100
         assert usage.output_tokens == 50
         assert usage.total_tokens == 150
+        assert usage.input_tokens_details.cached_tokens == 0
+        assert usage.output_tokens_details.reasoning_tokens == 0
+
+    def test_response_usage_with_cached_tokens(self):
+        usage = build_response_usage(100, 50, cached_tokens=30)
+        assert usage.input_tokens == 100
+        assert usage.input_tokens_details.cached_tokens == 30
+
+    def test_response_usage_with_reasoning_tokens(self):
+        usage = build_response_usage(100, 50, reasoning_tokens=20, cached_tokens=30)
+        assert usage.output_tokens == 50
+        assert usage.output_tokens_details.reasoning_tokens == 20
+        assert usage.input_tokens_details.cached_tokens == 30
+
+    def test_build_reasoning_output_item(self):
+        item = build_reasoning_output_item("Step 1: foo. Step 2: bar.")
+        assert item.type == "reasoning"
+        assert item.status == "completed"
+        assert item.id.startswith("rs_")
+        assert len(item.summary) == 1
+        assert item.summary[0].type == "summary_text"
+        assert item.summary[0].text == "Step 1: foo. Step 2: bar."
+
+    def test_build_reasoning_output_item_empty_text(self):
+        item = build_reasoning_output_item("")
+        assert item.type == "reasoning"
+        assert item.summary == []
 
 
 class TestResponseObject:
@@ -492,6 +950,26 @@ class TestResponseObject:
         )
         assert len(resp.output) == 1
         assert resp.usage.total_tokens == 15
+
+    def test_incomplete_details_on_truncation(self):
+        # A max_output_tokens truncation must surface as status="incomplete"
+        # with incomplete_details.reason, so clients can distinguish an
+        # incomplete turn from a natural stop (the Responses API has no
+        # finish_reason field).
+        resp = ResponseObject(
+            model="test-model",
+            status="incomplete",
+            incomplete_details={"reason": "max_output_tokens"},
+        )
+        assert resp.status == "incomplete"
+        assert resp.incomplete_details == {"reason": "max_output_tokens"}
+        dumped = resp.model_dump(exclude_none=True)
+        assert dumped["incomplete_details"] == {"reason": "max_output_tokens"}
+
+    def test_completed_response_omits_incomplete_details(self):
+        resp = ResponseObject(model="test-model")
+        dumped = resp.model_dump(exclude_none=True)
+        assert "incomplete_details" not in dumped
 
 
 # =============================================================================
@@ -584,7 +1062,9 @@ class TestResponseStore:
         state_dir = tmp_path / "response-state"
         store = ResponseStore(max_size=10, state_dir=state_dir)
         public = {"id": "resp_1", "created_at": 1, "output": []}
-        record = build_response_store_record(public, [{"role": "user", "content": "Hi"}], [])
+        record = build_response_store_record(
+            public, [{"role": "user", "content": "Hi"}], []
+        )
         store.put("resp_1", record)
 
         reloaded = ResponseStore(max_size=10, state_dir=state_dir)
@@ -660,9 +1140,7 @@ class TestConvertStoredResponse:
                 {
                     "type": "message",
                     "role": "assistant",
-                    "content": [
-                        {"type": "output_text", "text": "Hello!"}
-                    ],
+                    "content": [{"type": "output_text", "text": "Hello!"}],
                 }
             ]
         }
@@ -693,7 +1171,9 @@ class TestConvertStoredResponse:
         assert messages[0]["content"] == "Let me check."
         assert messages[0]["tool_calls"][0]["function"]["name"] == "get_weather"
         # arguments should be parsed as dict for Jinja2 chat templates
-        assert messages[0]["tool_calls"][0]["function"]["arguments"] == {"location": "Paris"}
+        assert messages[0]["tool_calls"][0]["function"]["arguments"] == {
+            "location": "Paris"
+        }
 
     def test_empty_output(self):
         stored = {"output": []}
@@ -727,6 +1207,44 @@ class TestConvertStoredResponse:
         assert len(messages) == 1
         assert messages[0]["content"] == "Let me check."
         assert messages[0]["tool_calls"][0]["id"] == "call_abc"
+
+    def test_normalize_reasoning_then_message(self):
+        output_items = [
+            {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "thinking"}],
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "answer"}],
+            },
+        ]
+        messages = normalize_response_output_to_messages(output_items)
+        assert len(messages) == 1
+        assert messages[0]["content"] == "answer"
+        assert messages[0]["reasoning_content"] == "thinking"
+
+    def test_normalize_reasoning_then_function_call(self):
+        # Tool-call output sequence — reasoning must attach to the
+        # synthesized assistant tool_calls message.
+        output_items = [
+            {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "deciding"}],
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_xyz",
+                "name": "lookup",
+                "arguments": '{"q":"foo"}',
+            },
+        ]
+        messages = normalize_response_output_to_messages(output_items)
+        assert len(messages) == 1
+        assert messages[0]["role"] == "assistant"
+        assert messages[0]["tool_calls"][0]["function"]["name"] == "lookup"
+        assert messages[0]["reasoning_content"] == "deciding"
 
 
 # =============================================================================
@@ -788,6 +1306,14 @@ class TestResponsesRequest:
         assert req.service_tier == "auto"
         assert req.prompt_cache_key == "test-key"
         assert req.reasoning["effort"] == "high"
+
+    def test_chat_template_kwargs(self):
+        req = ResponsesRequest(
+            model="test",
+            input="Hi",
+            chat_template_kwargs={"enable_thinking": False},
+        )
+        assert req.chat_template_kwargs == {"enable_thinking": False}
 
     def test_extra_fields_allowed(self):
         """Unknown fields should not cause validation errors."""
